@@ -254,3 +254,38 @@ Pi0 RoboTwin 使用对应的配置名：
 :doc:`RoboTwin <../../evaluations/guides/robotwin>` 上评估。其他转换模式与完整参数说明，
 请参见转换器包的 README
 （``rlinf/utils/ckpt_convertor/openpi/README.md``）。
+
+
+为转换后的 checkpoint 启动推理服务
+------------------------------------
+
+``examples/embodiment/serve_policy.py`` 使用与 OpenPI 原生
+``scripts/serve_policy.py`` 相同的 WebSocket/msgpack 协议提供
+``openpi_rlinf`` checkpoint 推理服务。因此，机器人侧可以继续使用
+``openpi_client.websocket_client_policy.WebsocketClientPolicy``。服务端实际运行
+RLinf 的 PyTorch Pi0/Pi0.5 模型；``config-name`` 用于选择 OpenPI 输入输出
+transform pipeline，必须与训练配置一致。
+
+以转换后的 Pi0.5 BEHAVIOR checkpoint 为例，在仓库根目录运行：
+
+.. code:: bash
+
+   python examples/embodiment/serve_policy.py \
+       --config-name pi05_behavior \
+       --checkpoint-dir /path/to/pi05_openpi_rlinf \
+       --norm-stats /path/to/pi05_openpi_rlinf/physical-intelligence/behavior/norm_stats.json \
+       --action-env-dim 23 \
+       --action-horizon 32 \
+       --device cuda \
+       --port 8000
+
+默认模型形状为 Pi0.5、32 维内部动作空间、200 个 prompt token，并执行 5 步
+flow-matching。只有训练配置使用了不同值时，才需要覆盖
+``--model-action-dim``、``--max-token-len`` 或 ``--num-steps``。
+``--action-env-dim`` 表示反归一化后的机器人动作维度，
+``--model-action-dim`` 表示补齐后的模型输出维度。
+
+服务端接收所选 OpenPI data config 规定的单条、无 batch 维 observation 字典，返回
+``{"actions": ...}`` 和耗时信息，并通过上游 WebSocket server 提供
+``/healthz``。如果客户端不发送 ``prompt``，请设置 ``--default-prompt``；使用
+``--record`` 可将请求和响应保存到 ``policy_records``。

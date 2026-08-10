@@ -275,3 +275,40 @@ The converted checkpoint can be evaluated on
 :doc:`RoboTwin <../../evaluations/guides/robotwin>`. For other conversion modes
 and full argument details, see
 ``rlinf/utils/ckpt_convertor/openpi/README.md``.
+
+
+Serving a converted checkpoint
+------------------------------
+
+``examples/embodiment/serve_policy.py`` serves an ``openpi_rlinf`` checkpoint
+through the same WebSocket/msgpack protocol as OpenPI's native
+``scripts/serve_policy.py``. Existing robot code can therefore continue using
+``openpi_client.websocket_client_policy.WebsocketClientPolicy``. The server
+executes RLinf's PyTorch Pi0/Pi0.5 model; ``config-name`` selects the OpenPI
+input/output transform pipeline and must match training.
+
+For a converted Pi0.5 BEHAVIOR checkpoint, run from the repository root:
+
+.. code:: bash
+
+   python examples/embodiment/serve_policy.py \
+       --config-name pi05_behavior \
+       --checkpoint-dir /path/to/pi05_openpi_rlinf \
+       --norm-stats /path/to/pi05_openpi_rlinf/physical-intelligence/behavior/norm_stats.json \
+       --action-env-dim 23 \
+       --action-horizon 32 \
+       --device cuda \
+       --port 8000
+
+The default model shape is Pi0.5 with a 32-dimensional internal action space,
+a 200-token prompt limit, and five flow-matching steps. Override
+``--model-action-dim``, ``--max-token-len``, or ``--num-steps`` only when the
+training configuration used different values. ``--action-env-dim`` is the
+robot action dimension after unnormalization, whereas
+``--model-action-dim`` is the padded model output dimension.
+
+The server accepts the same unbatched observation dictionary expected by the
+selected OpenPI data configuration and returns ``{"actions": ...}`` plus
+timing data. It also exposes ``/healthz`` through the upstream WebSocket server.
+Use ``--default-prompt`` when clients do not send a ``prompt`` key, and
+``--record`` to store request/response pairs under ``policy_records``.

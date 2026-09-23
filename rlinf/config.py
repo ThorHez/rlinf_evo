@@ -531,10 +531,22 @@ def validate_fsdp_cfg(cfg: DictConfig) -> DictConfig:
             sharding = (
                 str(cfg.fsdp_config.sharding_strategy).strip().lower().replace("-", "_")
             )
-            assert sharding == "no_shard", (
-                "openpi_rlinf only supports actor.fsdp_config.sharding_strategy="
-                f"'no_shard' (got {cfg.fsdp_config.sharding_strategy!r}). "
-                "Nested FSDP flattening (full_shard / shard_grad_op) is not supported."
+            task = str(
+                OmegaConf.select(cfg, "model.openpi.task", default=None) or "sft"
+            ).lower()
+            full_shard_sft = (
+                sharding == "full_shard"
+                and task == "sft"
+                and OmegaConf.select(cfg, "model.precision") == "fp32"
+                and str(cfg.fsdp_config.strategy).lower() == "fsdp"
+                and str(cfg.get("training_backend", "fsdp")).lower() == "fsdp"
+                and not OmegaConf.select(cfg, "model.is_lora", default=False)
+            )
+            assert sharding == "no_shard" or full_shard_sft, (
+                "openpi_rlinf full_shard requires task='sft', precision='fp32', "
+                "the fsdp backend/strategy, and is_lora=False. Other OpenPI "
+                "training paths require sharding_strategy='no_shard'; "
+                f"got task={task!r}, sharding_strategy={sharding!r}."
             )
 
         cfg.fsdp_config.forward_prefetch = cfg.fsdp_config.get(

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 
 import torch
 
@@ -26,6 +27,8 @@ from rlinf.models.embodiment.openpi_rlinf.modules import gemma, model, pointnet
 @dataclasses.dataclass
 class Pi0Config:
     dtype: str = "bfloat16"
+    # Optional backbone compute precision, independent of parameter storage.
+    compute_dtype: str | None = None
     paligemma_variant: gemma.Variant = "gemma_2b"
     action_expert_variant: gemma.Variant = "gemma_300m"
     pointnet_variant: pointnet.Variant = "pcd"
@@ -37,8 +40,30 @@ class Pi0Config:
     pi05: bool = False
     discrete_state_input: bool | None = None
     pcd: bool = False
+    # Nonnegative per-dimension SFT weights; None averages all action dimensions.
+    action_loss_mask: tuple[float, ...] | None = None
+    # Match the UMI V4 source environment's augmax wrist-image augmentation.
+    umi_v4_image_augmentation: bool = False
 
     def __post_init__(self):
+        if self.compute_dtype not in (None, "float32", "bfloat16"):
+            raise ValueError("compute_dtype must be float32, bfloat16, or None.")
+        if self.action_loss_mask is not None:
+            if len(self.action_loss_mask) != self.action_dim:
+                raise ValueError(
+                    "action_loss_mask must have one weight per model action "
+                    f"dimension ({self.action_dim}); got {len(self.action_loss_mask)}."
+                )
+            if any(
+                not math.isfinite(weight) or weight < 0
+                for weight in self.action_loss_mask
+            ):
+                raise ValueError(
+                    "action_loss_mask weights must be finite and nonnegative."
+                )
+            weight_sum = sum(self.action_loss_mask)
+            if not math.isfinite(weight_sum) or weight_sum <= 0:
+                raise ValueError("action_loss_mask must have a finite, positive sum.")
         if self.pi05 and self.max_token_len == 48:
             object.__setattr__(self, "max_token_len", 200)
         if self.discrete_state_input is None:

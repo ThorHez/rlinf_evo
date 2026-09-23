@@ -115,6 +115,40 @@ class FSDPVlaSftWorker(FSDPSftWorker):
     def save_checkpoint(self, save_path: str, step: int = 0) -> None:
         super().save_checkpoint(save_path, step)
 
+        if self.cfg.data.get("save_openpi_resume_state", False):
+            from rlinf.data.datasets.openpi_rlinf.official_sft_data_loader import (
+                get_openpi_sft_data_order,
+            )
+
+            if self.cfg.actor.model.openpi.config_name != "pi05_umi_v4":
+                raise ValueError(
+                    "OpenPI cursor recovery requires deterministic UMI V4 transforms."
+                )
+            state = get_openpi_sft_data_order(self.data_loader)
+            state.update(
+                rank=self._rank,
+                optimizer_steps=step,
+                data_epoch=self._data_epoch,
+                data_iter_offset=self._data_iter_offset,
+                micro_batch_size=self.micro_batch_size,
+                consumed_samples=self._data_iter_offset * self.micro_batch_size,
+                rng_state=get_rng_state(),
+                loader_generator_state=self.data_loader._data_loader.torch_loader.generator.get_state(),
+            )
+            all_states = [None] * self._world_size
+            torch.distributed.all_gather_object(all_states, state)
+            if self._rank == 0:
+                torch.save(
+                    {
+                        "version": 1,
+                        "global_step": step,
+                        "world_size": self._world_size,
+                        "ranks": all_states,
+                    },
+                    os.path.join(save_path, "openpi_resume_state.pt"),
+                )
+            torch.distributed.barrier()
+
         if isinstance(self.data_loader, StatefulDataLoader):
             state = self.data_loader.state_dict()
 
@@ -136,6 +170,36 @@ class FSDPVlaSftWorker(FSDPSftWorker):
 
     def load_checkpoint(self, load_path: str) -> None:
         super().load_checkpoint(load_path)
+
+        cursor_path = os.path.join(load_path, "openpi_resume_state.pt")
+        if self.cfg.data.get("save_openpi_resume_state", False) and os.path.exists(
+            cursor_path
+        ):
+            from rlinf.data.datasets.openpi_rlinf.official_sft_data_loader import (
+                restore_openpi_sft_iterator,
+            )
+
+            if self.cfg.actor.model.openpi.config_name != "pi05_umi_v4":
+                raise ValueError(
+                    "OpenPI cursor recovery requires deterministic UMI V4 transforms."
+                )
+            saved = torch.load(cursor_path, weights_only=False, map_location="cpu")
+            if saved["version"] != 1 or saved["world_size"] != self._world_size:
+                raise ValueError("OpenPI resume cursor version or world size mismatch.")
+            state = saved["ranks"][self._rank]
+            if state["rank"] != self._rank:
+                raise ValueError("OpenPI resume cursor rank mismatch.")
+            self.data_iter, self._data_iter_offset = restore_openpi_sft_iterator(
+                self.data_loader, state
+            )
+            self._data_epoch = 0
+            self.optimizer_steps = int(saved["global_step"])
+            set_rng_state(state["rng_state"])
+            self.log_info(
+                f"Restored OpenPI data cursor: {state['consumed_samples']} samples "
+                f"per rank, optimizer step {self.optimizer_steps}."
+            )
+            torch.distributed.barrier()
 
         if isinstance(self.data_loader, StatefulDataLoader):
             all_states = torch.load(

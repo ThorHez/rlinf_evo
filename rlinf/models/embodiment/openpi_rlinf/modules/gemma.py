@@ -27,6 +27,7 @@ from __future__ import annotations
 import dataclasses
 import math
 from collections.abc import Sequence
+from contextlib import nullcontext
 from typing import Literal
 
 import torch
@@ -358,7 +359,10 @@ class Attention(nn.Module):
         v_r = v.reshape(v.shape[0], v.shape[1], K, self.head_dim)
 
         # einsum "BTKGH,BSKH->BKGTS"
-        logits = torch.einsum("BTKGH,BSKH->BKGTS", q_r.float(), k_r.float())
+        # JAX requests FP32 accumulation/output even with BF16 Q/K. Autocast
+        # would otherwise downcast this einsum despite the explicit float().
+        with torch.autocast(device_type=q_r.device.type, enabled=False):
+            logits = torch.einsum("BTKGH,BSKH->BKGTS", q_r.float(), k_r.float())
 
         # Align mask to logits shape: logits is (B, K, G, T, S), mask is (B, 1, T, S)
         # We need mask to be (B, 1, 1, T, S) so it broadcasts to (B, K, G, T, S)
@@ -531,10 +535,12 @@ class Module(nn.Module):
         adarms: Sequence[bool] | bool = False,
         dropout: float = 0.0,
         use_gradient_checkpointing: bool = True,
+        use_compute_autocast: bool = False,
     ):
         super().__init__()
         self.configs = configs
         self.embed_dtype = _str_to_dtype(embed_dtype)
+        self.use_compute_autocast = use_compute_autocast
         if isinstance(adarms, bool):
             adarms = [adarms] * len(configs)
         self.adarms = list(adarms)
@@ -589,6 +595,26 @@ class Module(nn.Module):
         Returns:
             (outputs, new_kv_cache)
         """
+        device = next(x.device for x in embedded if x is not None)
+        context = (
+            torch.autocast(device.type, dtype=self.embed_dtype)
+            if self.use_compute_autocast
+            else nullcontext()
+        )
+        with context:
+            return self._forward(
+                embedded, positions, mask, adarms_cond, kv_cache=kv_cache
+            )
+
+    def _forward(
+        self,
+        embedded: Sequence[torch.Tensor | None],
+        positions: torch.Tensor,
+        mask: torch.Tensor,
+        adarms_cond: Sequence[torch.Tensor | None],
+        *,
+        kv_cache: tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> tuple[list[torch.Tensor | None], tuple[torch.Tensor, torch.Tensor]]:
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
 
@@ -616,16 +642,23 @@ class Module(nn.Module):
         new_layer_kv_caches = []
         for i, layer in enumerate(self.layers):
             layer_kv = layer_kv_caches[i] if i < len(layer_kv_caches) else None
-            if self.gradient_checkpointing and self.training:
-                xs, new_kv = torch.utils.checkpoint.checkpoint(
-                    layer,
-                    xs,
-                    layer_kv,
-                    positions,
-                    mask,
-                    adarms_cond,
-                    use_reentrant=self.gradient_checkpointing_use_reentrant,
-                )
+            if (
+                self.gradient_checkpointing
+                and self.training
+                and torch.is_grad_enabled()
+            ):
+                # Complete wrapped layer forwards during recomputation so FSDP
+                # runs its post-forward hooks and restores parameter sharding.
+                with torch.utils.checkpoint.set_checkpoint_early_stop(False):
+                    xs, new_kv = torch.utils.checkpoint.checkpoint(
+                        layer,
+                        xs,
+                        layer_kv,
+                        positions,
+                        mask,
+                        adarms_cond,
+                        use_reentrant=self.gradient_checkpointing_use_reentrant,
+                    )
             else:
                 xs, new_kv = layer(xs, layer_kv, positions, mask, adarms_cond)
             new_layer_kv_caches.append(new_kv)

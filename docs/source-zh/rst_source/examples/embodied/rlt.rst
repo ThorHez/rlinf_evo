@@ -6,10 +6,7 @@ RL Token：借助视觉-语言-动作模型启动在线强化学习
 1. 在示范数据上联合训练 VLA 检查点和 RLT token transformer。
 2. 冻结第一阶段得到的特征模型，用提取出的 RLT 状态训练一个轻量级 off-policy actor-critic。
 
-当前仓库中的示例配置面向 Franka peg insertion 和 ManiSkill
-``PegInsertionSideWideClearance-v1`` joint-control 仿真。pipeline 本身不绑定
-具体任务；只要示范数据、环境配置、动作维度、状态语义和 OpenPI dataconfig 对齐，
-就可以复用相同的两阶段结构。
+当前仓库中的示例配置覆盖 UMI V4 Stage 1 训练、Franka peg insertion 和 ManiSkill ``PegInsertionSideWideClearance-v1`` joint-control 仿真。只要示范数据、环境配置、动作维度、状态语义和 OpenPI dataconfig 对齐，就可以复用相同的两阶段结构。
 
 官方项目页：`Precise Manipulation with Efficient Online RL <https://www.pi.website/research/rlt>`_。
 
@@ -54,6 +51,9 @@ RLT 将表示学习和在线 RL 控制拆开。
    * - 阶段
      - 配置
      - 作用
+   * - UMI Stage 1
+     - ``examples/sft/config/umi_rlt_stage1_sft_openpi_pi05.yaml``
+     - 使用 UMI V4 示范数据，通过 FP32 短训练检查 Pi0.5 与 RLT 联合训练。
    * - Franka Stage 1
      - ``examples/sft/config/realworld_rlt_stage1_sft_openpi_pi05.yaml``
      - 在 Franka 示范数据上联合 SFT π₀.₅ 和 RLT token transformer。
@@ -183,6 +183,8 @@ Stage 1 中比较关键的字段：
 ``repo_id``、``config_name`` 和归一化统计需要与 Stage 2 特征模型配置保持一致。
 ``openpi_data`` 应写在 ``actor.model`` 下。
 
+需要从 VLA 目标中排除 padding action 时，将 ``actor.model.openpi.action_loss_mask`` 配置为长度等于 ``model_action_dim`` 的非负权重。VLA loss 先将各维平方误差加权求和，再除以权重和，最后对 batch 和 action horizon 取平均。权重必须有限且总和大于零；省略 mask 时仍对模型全部 action 维度取平均。普通 SFT 和 RLT Stage 1 都使用这个 mask，RLT 重建目标保持不变。
+
 .. note::
 
    ManiSkill joint 示例不依赖 ``state_indices`` 手工切片。``pi05_rlt_maniskill_joint``
@@ -221,11 +223,7 @@ Franka 真机配置中，``keyboard_reward_wrapper: rlt_policy_switch`` 会提�
 ``rlt_switch_flags`` 标记。在操作员按下 ``b`` 之前，实际执行 VLA 的
 ``ref_chunk``；按下 ``b`` 之后，实际执行 Stage 2 actor 的动作。
 
-ManiSkill joint 配置中，``env.*.rlt_policy_switch`` 使用任务信息自动产生
-``rlt_switch_flags``（actor/ref 阶段）和 ``intervene_flag``（expert 接管请求）。
-HF rollout route 根据这些标记在整 chunk 级别选择 actor action、VLA
-``ref_chunk`` 或 expert action，并把 ``record_transition``、``actor_switch`` 和
-``intervention_requested`` 写入 ``forward_inputs``，供 replay 和监控使用。
+ManiSkill joint 配置中，``env.*.rlt_policy_switch`` 使用任务信息自动产生 ``rlt_switch_flags``\ （actor/ref 阶段）和 ``intervene_flag``\ （expert 接管请求）。HF rollout route 根据这些标记在整 chunk 级别选择 actor action、VLA ``ref_chunk`` 或 expert action，并把 ``record_transition``、``actor_switch`` 和 ``intervention_requested`` 写入 ``forward_inputs``，供 replay 和监控使用。
 
 critic 使用 chunked rewards 上的 TD target。一个 action chunk 内的奖励会先按折扣累计，然后用下一状态 Q 值 bootstrap：
 
@@ -320,6 +318,72 @@ Stage 2 的 actor loss 为：
 普通 policy step 中，BC target 是 VLA reference action。如果某一步存了
 human intervention action，那么这一步的 BC target 会切换成人类动作。ManiSkill
 默认关闭 ``expert_takeover``，因此默认路线只使用 VLA reference 和 actor action。
+
+运行 UMI Stage 1
+----------------
+
+使用 ``examples/sft/config/umi_rlt_stage1_sft_openpi_pi05.yaml``，在 UMI V4 示范数据上联合训练转换后的原生 PyTorch Pi0.5 与 RLT token transformer。``pi05_umi_v4`` dataconfig 要求 LeRobot 数据集的每一行已经包含 16 步、每步 10 维的 action chunk。
+
+每条 observation 包含两帧 16 维 state 和最新的左腕 RGB 图像。数据加载器在 prompt 和离散 state 的 tokenization 阶段保留 ``(2, 16)`` 的 state shape，完成后再展平为 32 维。归一化使用原 checkpoint 的 min/max 统计，仅处理 state 和 action 的 XYZ；旋转与夹爪数值保持原有尺度。模型输入的 action 从 ``(16, 10)`` padding 到 ``(16, 32)``。示例的 ``action_loss_mask`` 前 10 项为 1、后 22 项为 0，VLA 目标仅对 10 个真实 action 维度取平均。
+
+启动前，在示例配置中填写数据集、转换后的 checkpoint 及其原始归一化文件路径：
+
+.. code:: yaml
+
+   data:
+     train_data_paths: /path/to/umi_lerobot_dataset
+   actor:
+     model:
+       model_path: /path/to/pi05_umi_fp32
+       precision: fp32
+       openpi_data:
+         repo_id: umi_v4
+         norm_stats_path: /path/to/pi05_umi_fp32/assets/norm_stats.json
+       openpi:
+         config_name: pi05_umi_v4
+
+示例使用 8 张 GPU 执行 20 个 optimizer step，每张 GPU 的 micro batch size 为 1，global batch size 为 8；模型参数和 FSDP 通信均使用 FP32。在 OpenPI 环境中，从仓库根目录启动：
+
+.. code:: bash
+
+   bash examples/sft/run_vla_sft.sh umi_rlt_stage1_sft_openpi_pi05
+
+短训练用于检查 ``vla_loss`` 和 ``rlt_loss`` 是否有限，以及保存的模型能否重新加载。FSDP 会同步 FP32 图像 stem 以及其他可训练 VLA 和 RLT 参数的梯度。对比 DCP 与完整 checkpoint 中的模型 tensor，检查各副本是否一致，其中应包含 ``img.stem.weight`` 和 ``img.stem.bias``。
+
+最终的 ``actor/model_state_dict/full_weights.pt`` 同时包含 VLA 和 ``rlt_module`` 权重。应保留完整 checkpoint、解析后的训练配置和原始归一化文件，供 Stage 2 特征模型使用。
+
+确认短训练正常后，使用 ``examples/sft/config/umi_rlt_stage1_sft_openpi_pi05_20k.yaml`` 执行 20,000 个 optimizer step。该配置使用 8 张 GPU，每卡 micro batch size 为 9，global batch size 为 72；每个 optimizer step 中，每个 rank 执行一次前向与反向计算。每个 rank 启动 1 个数据加载 worker，共 8 个。
+
+20k 配置通过 ``actor.fsdp_config.strategy: fsdp`` 和 ``actor.fsdp_config.sharding_strategy: full_shard``，将参数、梯度和 Adam 状态分片到各 rank。原生 ``openpi_rlinf`` 模型的这一 FSDP1 模式要求 ``actor.model.openpi.task: sft``、FP32 参数存储和 ``actor.model.is_lora: false``。配置同时启用 ``actor.fsdp_config.gradient_checkpointing: true`` 和 ``actor.fsdp_config.gradient_checkpointing_use_reentrant: false``，在反向计算时重新计算 Gemma 与 SigLIP 的 activation，以降低 activation 占用的显存。
+
+20k 配置将主干网络的 BF16 计算与 FP32 训练状态分开，沿用源 OpenPI 训练 pipeline 的精度设置：``actor.model.precision: fp32`` 保留 FP32 参数，``actor.model.openpi.compute_dtype: bf16`` 启用 BF16 计算。Gemma、SigLIP encoder 与 projector、RLT transformer 使用 BF16 计算；参数、梯度、Adam 状态和 FSDP 通信保持 FP32。图像 stem、action 与 time projection、Gemma attention logits 和 loss 也使用 FP32。显式指定 ``compute_dtype`` 时必须使用 FP32 参数存储；不指定该字段时沿用模型原有的精度行为。
+
+该配置沿用 OpenPI-UMI 中 ``pi05_umi_32d_80k_95_real_umi_batch_72_v4`` 的 observation 和 action pipeline，并通过 ``actor.model.openpi.umi_v4_image_augmentation: true`` 在训练期间启用 UMI V4 图像增强。按照源环境 Augmax 0.4.1 的实际行为，每张左腕图像以 0.5 的概率执行颜色扰动，亮度参数范围为 ``[-0.3, 0.3]``，对比度为 ``[-0.4, 0.4]``，色相为 ``[-0.1, 0.1]``，饱和度保持不变。评估时保留原始颜色。PyTorch 与 JAX 使用不同的随机数序列，相同 seed 不会产生完全相同的增强图像。
+
+优化器使用 RLT Stage 1 的独立设置：峰值学习率为 ``1e-5``，warmup 为 1,000 步，随后按 cosine 衰减，在第 20,000 步降至 ``2.5e-6``。原 SFT 配置的学习率计划和 EMA 不属于这份 Stage 1 配置；checkpoint 保存当前训练中的 VLA 和 RLT 权重。
+
+在 20k 配置中填写数据集、模型和归一化文件路径，为缓存和输出选择容量充足的目录，然后在 OpenPI 环境中从仓库根目录启动：
+
+.. code:: bash
+
+   export EMBODIED_PATH="$PWD/examples/sft"
+   export PYTHONPATH="$PWD"
+   export HF_DATASETS_CACHE=/path/to/dataset_cache
+   export JAX_PLATFORMS=cpu
+   export NVIDIA_TF32_OVERRIDE=0
+   python examples/sft/train_vla_sft.py \
+       --config-name umi_rlt_stage1_sft_openpi_pi05_20k \
+       runner.logger.log_path=/path/to/rlt_runs
+
+该命令将 loader 的 JAX 运算限制在 CPU，并关闭 PyTorch 训练中的 TF32。训练每隔 2,000 个 optimizer step 保存完整 checkpoint，第 20,000 步也会保存。应为数据缓存和全部 10 个 checkpoint 预留磁盘空间；保存间隔由 ``runner.save_interval`` 控制，已保存的 checkpoint 会保留。训练期间观察 ``vla_loss``、``rlt_loss``、梯度范数和学习率。VLA SFT worker 的动作质量与 RL token 表征质量需要单独评估，训练 loss 本身不能证明这两项结果。
+
+20k 配置通过 ``data.save_openpi_resume_state: true`` 支持在首个数据 epoch 内恢复采样位置。每个 checkpoint 的 ``actor/openpi_resume_state.pt`` 保存各 rank 已读取的样本数和训练 RNG 状态。将 ``runner.resume_dir`` 指向 ``checkpoints/global_step_<N>`` 目录，即可随模型、优化器和 scheduler 一起恢复这些状态。恢复时先重放确定性的 UMI V4 loader 到已保存的位置，再恢复各 rank 的训练 RNG 状态。
+
+恢复时应保持数据集、loader 中的确定性 transform、sampler 设置和 world size 不变。若各 rank 已读取的样本数都能被新的 micro batch size 整除，可以调整 micro batch，并相应调整梯度累积次数以保持目标 global batch size。该恢复格式仅支持首个数据 epoch。改变 batch 分组或计算精度可能改变后续随机数的消耗方式和计算结果，因此不保证调整前后逐位一致。
+
+.. warning::
+
+   官方 OpenPI loader 只有在启用 UMI V4 恢复选项且 checkpoint 包含对应状态文件时，才会恢复采样位置和训练 RNG。若选项未启用或状态文件缺失，``runner.resume_dir`` 仅恢复模型、优化器和 scheduler，数据采样会重新开始。UMI 恢复格式不恢复数据加载 worker 内部随机 transform 的状态。
 
 运行当前 Franka 示例
 --------------------

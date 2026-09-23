@@ -24,6 +24,7 @@ from torch.distributed.checkpoint.state_dict import (
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
+from torch.utils._pytree import tree_map_only
 
 from rlinf.hybrid_engines.fsdp import FSDP, FSDPModule
 from rlinf.hybrid_engines.fsdp.utils import FSDPVersion, to_local_if_dtensor
@@ -41,7 +42,9 @@ class Checkpoint(Stateful):
         checkpoint_format: str = "dcp",
     ):
         self.model = model
-        self.optimizers = optimizers
+        self.optimizers = (
+            optimizers if isinstance(optimizers, Optimizer) else tuple(optimizers)
+        )
         self.lr_schedulers = (
             (lr_schedulers,)
             if isinstance(lr_schedulers, LRScheduler)
@@ -115,6 +118,19 @@ class Checkpoint(Stateful):
             self._load_local_optim_state_dicts(state["optimizers"])
 
         else:
+            if self.opts.cpu_offload:
+                optimizers = (
+                    (self.optimizers,)
+                    if isinstance(self.optimizers, Optimizer)
+                    else self.optimizers
+                )
+                for optimizer in optimizers:
+                    # Retain initialized state so PyTorch does not create it
+                    # again before loading. Release the old GPU buffers before
+                    # optimizer.load_state_dict allocates their replacements.
+                    optimizer.state = tree_map_only(
+                        torch.Tensor, lambda value: value.to("cpu"), optimizer.state
+                    )
             set_state_dict(
                 model=self.model,
                 optimizers=self.optimizers,

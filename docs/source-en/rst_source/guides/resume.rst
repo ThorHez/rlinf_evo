@@ -87,6 +87,7 @@ FSDP/FSDP2 Checkpoint's file structure looks like this:
 
 FSDP/FSDP2 saves and loads checkpoints via DCP (torch.distributed.checkpoint), resulting in a set of distributed checkpoint files (.distcp).
 Each file contains a slice of model parameters, optimizer state, and RNG state.
+During a DCP restore with CPU offload, initialized optimizer state is moved to host memory before its checkpoint replacement is loaded, reducing peak GPU memory while preserving optimizer steps and moments.
 
 
 Resuming training
@@ -120,5 +121,4 @@ Resuming training
 
    To verify resumption, look for the log line.  
    If the next training step starts at 30, then the resume is working well!
-
 

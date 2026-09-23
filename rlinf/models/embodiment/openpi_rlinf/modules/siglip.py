@@ -19,6 +19,8 @@ Implements the So400m/14 ViT variant with pool_type="none" used by Pi0.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -80,8 +82,10 @@ class Encoder1DBlock(nn.Module):
         num_heads: int,
         mlp_dim: int | None = None,
         dropout: float = 0.0,
+        compute_dtype: torch.dtype | None = None,
     ):
         super().__init__()
+        self.compute_dtype = compute_dtype
         self.norm1 = nn.LayerNorm(dim, eps=1e-6)
         self.norm2 = nn.LayerNorm(dim, eps=1e-6)
         self.attn = nn.MultiheadAttention(
@@ -95,11 +99,15 @@ class Encoder1DBlock(nn.Module):
         # Cast only the LayerNorm input. Keep residual dtype (OpenPI mixed precision).
         norm_dtype = self.norm1.weight.dtype
         y = self.norm1(x.to(norm_dtype))
+        if self.compute_dtype is not None:
+            y = y.to(self.compute_dtype)
         y, _ = self.attn(y, y, y)
         y = self.dropout1(y)
         x = x + y
 
         y = self.norm2(x.to(norm_dtype))
+        if self.compute_dtype is not None:
+            y = y.to(self.compute_dtype)
         y = self.mlp(y)
         y = self.dropout2(y)
         x = x + y
@@ -117,8 +125,10 @@ class Encoder(nn.Module):
         mlp_dim: int | None = None,
         dropout: float = 0.0,
         use_gradient_checkpointing: bool = False,
+        compute_dtype: torch.dtype | None = None,
     ):
         super().__init__()
+        self.compute_dtype = compute_dtype
         self.layers = nn.ModuleList(
             [
                 Encoder1DBlock(
@@ -126,6 +136,7 @@ class Encoder(nn.Module):
                     num_heads,
                     mlp_dim,
                     dropout,
+                    compute_dtype,
                 )
                 for _ in range(depth)
             ]
@@ -138,14 +149,40 @@ class Encoder(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for layer in self.layers:
-            if self.gradient_checkpointing and self.training:
-                x = torch.utils.checkpoint.checkpoint(
-                    layer, x, use_reentrant=self.gradient_checkpointing_use_reentrant
-                )
+            if (
+                self.gradient_checkpointing
+                and self.training
+                and torch.is_grad_enabled()
+            ):
+                # FSDP's post-forward hooks must also run during recomputation.
+                with torch.utils.checkpoint.set_checkpoint_early_stop(False):
+                    x = torch.utils.checkpoint.checkpoint(
+                        layer,
+                        x,
+                        use_reentrant=self.gradient_checkpointing_use_reentrant,
+                    )
             else:
                 x = layer(x)
         x = self.norm(x.to(self.norm.weight.dtype))
+        if self.compute_dtype is not None:
+            x = x.to(self.compute_dtype)
         return x
+
+
+class Float32Conv2d(nn.Conv2d):
+    """Convolution with float32 inputs and weights, including after dtype casts."""
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        with torch.autocast(device_type=input.device.type, enabled=False):
+            return F.conv2d(
+                input.float(),
+                self.weight.float(),
+                None if self.bias is None else self.bias.float(),
+                stride=self.stride,
+                padding=self.padding,
+                dilation=self.dilation,
+                groups=self.groups,
+            )
 
 
 class SigLIPViT(nn.Module):
@@ -161,6 +198,7 @@ class SigLIPViT(nn.Module):
         num_classes: int = 0,
         use_gradient_checkpointing: bool = False,
         dtype_mm: str = "float32",
+        use_compute_autocast: bool = False,
     ):
         super().__init__()
 
@@ -175,8 +213,9 @@ class SigLIPViT(nn.Module):
         self.dtype_mm = (
             _str_to_dtype(dtype_mm) if isinstance(dtype_mm, str) else dtype_mm
         )
+        self.use_compute_autocast = use_compute_autocast
 
-        self.stem = nn.Conv2d(
+        self.stem = Float32Conv2d(
             3,
             self.width,
             kernel_size=self.patch_size,
@@ -199,6 +238,7 @@ class SigLIPViT(nn.Module):
             mlp_dim=self.mlp_dim,
             dropout=0.0,
             use_gradient_checkpointing=use_gradient_checkpointing,
+            compute_dtype=self.dtype_mm if use_compute_autocast else None,
         )
 
         # Output head: projects width -> num_classes (used when num_classes matches PaliGemma width)
@@ -250,13 +290,8 @@ class SigLIPViT(nn.Module):
         # --- Stem + pos_embed in float32 (matching JAX) ---
         # image is (B, H, W, C) -> (B, C, H, W)
         x = image.permute(0, 3, 1, 2)
-        x = F.conv2d(
-            x.float(),
-            self.stem.weight.float(),
-            None if self.stem.bias is None else self.stem.bias.float(),
-            stride=self.stem.stride,
-            padding=self.stem.padding,
-        )
+        # Enter the stem module so FSDP can materialize parameters and sync gradients.
+        x = self.stem(x)
         B, C, h, w = x.shape
         x = x.reshape(B, C, h * w).permute(0, 2, 1)  # (B, h*w, width)
 
@@ -270,20 +305,25 @@ class SigLIPViT(nn.Module):
         # --- Cast to model dtype for encoder (matching JAX x.astype(self.dtype_mm)) ---
         x = x.to(self.dtype_mm)
 
-        # Encoder
-        x = self.encoder(x)
+        context = (
+            torch.autocast(x.device.type, dtype=self.dtype_mm)
+            if self.use_compute_autocast
+            else nullcontext()
+        )
+        with context:
+            x = self.encoder(x)
 
-        if self.pool_type == "map":
-            x = self.map_head(x)
-        elif self.pool_type == "gap":
-            x = x.mean(dim=1)
-        elif self.pool_type == "tok":
-            x = x[:, 0]
-        # pool_type == "none": keep all tokens
+            if self.pool_type == "map":
+                x = self.map_head(x)
+            elif self.pool_type == "gap":
+                x = x.mean(dim=1)
+            elif self.pool_type == "tok":
+                x = x[:, 0]
+            # pool_type == "none": keep all tokens
 
-        # Apply output head projection (no tanh — JAX num_classes head doesn't apply activation)
-        if self.head is not None:
-            x = self.head(x)
+            # JAX also uses dtype_mm for the multimodal projector.
+            if self.head is not None:
+                x = self.head(x)
 
         return x, None
 

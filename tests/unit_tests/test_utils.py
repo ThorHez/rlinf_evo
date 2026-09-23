@@ -25,6 +25,7 @@ import textwrap
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from omegaconf import OmegaConf
@@ -32,6 +33,47 @@ from omegaconf import OmegaConf
 from rlinf.algorithms.utils import compute_entropy_loss
 from rlinf.runners.reasoning_runner import ReasoningRunner
 from rlinf.utils.metric_utils import compute_evaluate_metrics, compute_rollout_metrics
+
+
+@pytest.mark.parametrize("params_collection", [False, True])
+@pytest.mark.parametrize("leaf_format", ["plain", "nnx", "mixed"])
+def test_load_jax_params_preserves_values_and_module_names(
+    tmp_path, params_collection, leaf_format
+):
+    jax = pytest.importorskip("jax")
+    ocp = pytest.importorskip("orbax.checkpoint")
+    from rlinf.utils.ckpt_convertor.openpi.jax_to_openpi_rlinf import _load_jax_params
+
+    # These values would change if loading passed through bfloat16.
+    kernel = np.array([[1.0001, -2.0003], [0.1234567, 17.12345]], dtype=np.float32)
+    expected = {
+        "PaliGemma": {"img": {"attention": {"value": {"kernel": kernel}}}},
+        "action_in_proj": {"kernel": kernel.T, "bias": kernel[0]},
+    }
+    params = jax.tree_util.tree_map(jax.numpy.asarray, expected)
+    if leaf_format == "nnx":
+        params = jax.tree_util.tree_map(lambda array: {"value": array}, params)
+    elif leaf_format == "mixed":
+        params["action_in_proj"]["kernel"] = {
+            "value": params["action_in_proj"]["kernel"]
+        }
+    saved = {"params": params} if params_collection else params
+    with ocp.PyTreeCheckpointer() as checkpointer:
+        checkpointer.save(str(tmp_path / "params"), saved)
+
+    restored = _load_jax_params(tmp_path)
+
+    assert jax.tree_util.tree_structure(restored) == jax.tree_util.tree_structure(
+        expected
+    )
+    for actual, original in zip(
+        jax.tree_util.tree_leaves(restored),
+        jax.tree_util.tree_leaves(expected),
+        strict=True,
+    ):
+        assert isinstance(actual, np.ndarray)
+        assert actual.dtype == np.float32
+        np.testing.assert_array_equal(actual, original)
 
 
 def test_compute_evaluate_metrics_reports_interact_delay_wait_time_stats():

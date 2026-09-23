@@ -73,8 +73,21 @@ from rlinf.models.embodiment.openpi.dataconfig.robocasa_dataconfig import (
 from rlinf.models.embodiment.openpi.dataconfig.robotwin_aloha_dataconfig import (
     LeRobotAlohaDataConfig,
 )
+from rlinf.models.embodiment.openpi.dataconfig.umi_dataconfig import (
+    LeRobotUmiV4DataConfig,
+)
 
 _CONFIGS = [
+    TrainConfig(
+        name="pi05_umi_v4",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_dim=32, action_horizon=16, max_token_len=200
+        ),
+        data=LeRobotUmiV4DataConfig(
+            repo_id="umi_v4",
+            assets=AssetsConfig(asset_id="assets"),
+        ),
+    ),
     TrainConfig(
         name="pi0_libero",
         model=pi0_config.Pi0Config(),

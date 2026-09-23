@@ -201,6 +201,62 @@ def _observation_to_dtype(obs: Observation, dtype: torch.dtype) -> Observation:
     )
 
 
+def apply_umi_v4_color_jitter(
+    images: torch.Tensor,
+    brightness: torch.Tensor,
+    contrast: torch.Tensor,
+    hue_shift: torch.Tensor,
+    apply: torch.Tensor,
+) -> torch.Tensor:
+    """Apply the source UMI augmax color transform with fixed parameters.
+
+    Args:
+        images: Float32 RGB images in [0, 1], shaped [B, H, W, 3].
+        brightness: One adjustment in [-0.3, 0.3] per image.
+        contrast: One adjustment in [-0.4, 0.4] per image.
+        hue_shift: One hue offset in [-0.1, 0.1] per image.
+        apply: One boolean per image; source augmax uses probability 0.5.
+
+    Returns:
+        Images with the same shape. This preserves augmax 0.4.1's actual
+        saturation behavior: its ColorJitter discards the saturation result.
+    """
+    brightness = brightness[:, None, None]
+    contrast = contrast[:, None, None]
+    hue_shift = hue_shift[:, None, None]
+    value, largest = images.max(dim=-1)
+    color_range = value - images.min(dim=-1).values
+    second = images.gather(-1, ((largest + 1) % 3)[..., None])[..., 0]
+    third = images.gather(-1, ((largest + 2) % 3)[..., None])[..., 0]
+    hue = torch.where(
+        color_range == 0,
+        0.0,
+        (2 * largest + (second - third) / color_range.clamp_min(1e-20)) / 6,
+    )
+    saturation = torch.where(value == 0, 0.0, color_range / value.clamp_min(1e-20))
+
+    value = torch.where(
+        brightness < 0,
+        value * (1 + brightness),
+        value * (1 - brightness) + brightness,
+    )
+    slant = torch.tan((contrast + 1) * (torch.pi / 4))
+    # Algebraically equivalent to augmax's p1, including the contrast=0 limit.
+    p1 = slant / (2 * (1 + slant))
+    p2 = 1 - p1
+    value = torch.where(
+        value > p2,
+        value / slant + 1 - 1 / slant,
+        torch.where(value < p1, value / slant, slant * (value - 0.5) + 0.5),
+    )
+    hue = hue + hue_shift
+    n = images.new_tensor([5, 3, 1])
+    k = torch.remainder(n + hue[..., None] * 6, 6)
+    triangle = torch.minimum(k, 4 - k).clamp(0, 1)
+    transformed = value[..., None] - value[..., None] * saturation[..., None] * triangle
+    return torch.where(apply[:, None, None, None], transformed, images)
+
+
 def preprocess_observation(
     observation: Observation,
     *,
@@ -208,6 +264,7 @@ def preprocess_observation(
     image_keys: Sequence[str] = IMAGE_KEYS,
     image_resolution: tuple[int, int] = IMAGE_RESOLUTION,
     rng: torch.Generator | None = None,
+    umi_v4_image_augmentation: bool = False,
 ) -> Observation:
     """Preprocess observations with optional image augmentations.
 
@@ -234,7 +291,25 @@ def preprocess_observation(
         if image.shape[1:3] != image_resolution:
             image = resize_with_pad_torch(image, *image_resolution)
 
-        if train:
+        if train and umi_v4_image_augmentation:
+            # UMI V4 has one valid view. Keep masked placeholders unchanged.
+            if key == "left_wrist_0_rgb":
+                random_device = rng.device if rng is not None else image.device
+                samples = torch.rand(
+                    image.shape[0], 4, device=random_device, generator=rng
+                ).to(image.device)
+                image = (
+                    apply_umi_v4_color_jitter(
+                        image.float() / 2.0 + 0.5,
+                        samples[:, 0] * 0.6 - 0.3,
+                        samples[:, 1] * 0.8 - 0.4,
+                        samples[:, 2] * 0.2 - 0.1,
+                        samples[:, 3] < 0.5,
+                    )
+                    * 2.0
+                    - 1.0
+                )
+        elif train:
             # Convert from [-1, 1] to [0, 1] for augmentations
             image = image / 2.0 + 0.5
             # image is in (B, H, W, C) format

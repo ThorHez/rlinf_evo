@@ -17,6 +17,7 @@
 import asyncio
 import copy
 import inspect
+import io
 import json
 import random
 import time
@@ -2744,3 +2745,210 @@ def test_vlm_trend_batch_video_metadata_stays_nested_per_sample():
     assert metadata[0][0].total_num_frames == 5
     assert metadata[0][0].frames_indices == [0, 1, 2, 3, 4]
     assert metadata[1][1].total_num_frames == 5
+
+
+@pytest.fixture
+def umi_v4_data_config(tmp_path, monkeypatch):
+    pytest.importorskip("openpi")
+    sentencepiece = pytest.importorskip("sentencepiece")
+    from openpi.shared import download
+
+    from rlinf.models.embodiment.openpi.dataconfig import get_openpi_config
+
+    model_bytes = io.BytesIO()
+    sentencepiece.SentencePieceTrainer.train(
+        sentence_iterator=iter(
+            ["Task: pick cube, State: [0 1 2 3 4 5 6 7 8 9]; Action:"]
+        ),
+        model_writer=model_bytes,
+        model_type="char",
+        vocab_size=64,
+        hard_vocab_limit=False,
+        num_threads=1,
+        minloglevel=2,
+    )
+    tokenizer_path = tmp_path / "tokenizer.model"
+    tokenizer_path.write_bytes(model_bytes.getvalue())
+    monkeypatch.setattr(
+        download, "maybe_download", lambda *args, **kwargs: tokenizer_path
+    )
+    stats = {
+        key: {
+            "min": [-2.0] * dim,
+            "max": [2.0] * dim,
+            "q01": [-0.1] * dim,
+            "q99": [0.1] * dim,
+        }
+        for key, dim in (("state", 16), ("actions", 10))
+    }
+    stats_path = tmp_path / "norm_stats.json"
+    stats_path.write_text(json.dumps({"norm_stats": stats}))
+    config = get_openpi_config(
+        "pi05_umi_v4",
+        repo_id=str(tmp_path / "dataset"),
+        data_kwargs={"norm_stats_path": str(stats_path)},
+    )
+    data_config = config.data.create(config.assets_dirs, config.model)
+    processor = sentencepiece.SentencePieceProcessor(model_proto=model_bytes.getvalue())
+    return data_config, processor
+
+
+def _umi_v4_sample():
+    return {
+        "observation.robot0_eef_pos": np.array(
+            [[1, -1, 0], [0.5, 0, -0.5]], dtype=np.float32
+        ),
+        "observation.robot0_eef_rot_axis_angle": np.ones((2, 6), dtype=np.float32),
+        "observation.robot0_eef_rot_axis_angle_wrt_start": np.zeros(
+            (2, 6), dtype=np.float32
+        ),
+        "observation.robot0_gripper_width": np.full((2, 1), 0.08, dtype=np.float32),
+        "observation.left_wrist_0_rgb_1": np.full((3, 224, 224), 0.5, dtype=np.float32),
+        "actions": np.arange(160, dtype=np.float32).reshape(16, 10) / 100,
+        "task": "pick_cube",
+    }
+
+
+def test_umi_v4_official_loader_preserves_history_and_action_contract(
+    umi_v4_data_config,
+):
+    from openpi.training.data_loader import transform_dataset
+    from openpi.transforms import Unnormalize, compose
+
+    data_config, processor = umi_v4_data_config
+    sample = _umi_v4_sample()
+    result = transform_dataset([sample], data_config)[0]
+    assert data_config.action_sequence_keys == ()
+    assert data_config.norm_stats == {}
+    assert result["state"].shape == (32,)
+    state = result["state"].reshape(2, 16)
+    np.testing.assert_array_equal(
+        state[:, :3], sample["observation.robot0_eef_pos"] / 2
+    )
+    np.testing.assert_array_equal(state[:, 3:9], np.ones((2, 6)))
+    np.testing.assert_array_equal(
+        state[:, -1:], sample["observation.robot0_gripper_width"]
+    )
+    decoded = processor.decode(
+        result["tokenized_prompt"][result["tokenized_prompt_mask"]].tolist()
+    )
+    # History rows must remain separate bracketed arrays during tokenization.
+    assert decoded.count("[") == decoded.count("]") == 2
+    assert "pick cube" in decoded
+    assert result["actions"].shape == (16, 32)
+    np.testing.assert_array_equal(
+        result["actions"][:, :3], sample["actions"][:, :3] / 2
+    )
+    np.testing.assert_array_equal(result["actions"][:, 3:10], sample["actions"][:, 3:])
+    np.testing.assert_array_equal(result["actions"][:, 10:], 0)
+    assert result["image_mask"] == {
+        "base_0_rgb": False,
+        "left_wrist_0_rgb": True,
+        "right_wrist_0_rgb": False,
+    }
+    np.testing.assert_array_equal(result["image"]["left_wrist_0_rgb"], 127)
+    output = compose(
+        [Unnormalize(data_config.norm_stats), *data_config.data_transforms.outputs]
+    )({"actions": result["actions"]})
+    np.testing.assert_array_equal(output["actions"], sample["actions"])
+
+
+@pytest.mark.parametrize("use_minmax", [True, False])
+def test_umi_v4_normalization_constant_xyz_and_unscaled_gripper(use_minmax):
+    pytest.importorskip("openpi")
+    from rlinf.models.embodiment.openpi.policies.umi_policy import UmiV4Normalize
+
+    stats = {}
+    for key, dim in (("state", 16), ("actions", 10)):
+        lower = [3.0, -2.0, 1.0] + [-5.0] * (dim - 3)
+        upper = [3.0, 2.0, 1.0 + 1e-8] + [5.0] * (dim - 3)
+        stats[key] = {"q01": lower, "q99": upper}
+        if use_minmax:
+            stats[key].update(min=lower, max=upper)
+    normalizer = UmiV4Normalize.from_stats(stats)
+    state = np.array([[3.0, 1.0, 1.0] + [0.8] * 13] * 2)
+    result = normalizer({"state": state})["state"]
+    np.testing.assert_array_equal(result[:, :3], [[0.0, 0.5, 0.0]] * 2)
+    np.testing.assert_array_equal(result[:, 3:], state[:, 3:])
+
+
+def test_umi_v4_rejects_double_chunked_actions(umi_v4_data_config):
+    from openpi.training.data_loader import transform_dataset
+
+    data_config, _ = umi_v4_data_config
+    sample = _umi_v4_sample()
+    sample["actions"] = np.zeros((16, 16, 10), dtype=np.float32)
+    with pytest.raises(ValueError, match="already contain one"):
+        transform_dataset([sample], data_config)[0]
+
+
+class _OpenPiResumeDataset(torch.utils.data.Dataset):
+    def __len__(self):
+        return 120
+
+    def __getitem__(self, index):
+        return {
+            "state": np.asarray([index], dtype=np.float32),
+            "image": {"base_0_rgb": np.zeros((8, 8, 3), dtype=np.float32)},
+            "image_mask": {"base_0_rgb": np.True_},
+            "actions": np.asarray([[index]], dtype=np.float32),
+        }
+
+
+def _make_openpi_resume_loader(rank, batch_size):
+    loader_module = pytest.importorskip("openpi.training.data_loader")
+    config_module = pytest.importorskip("openpi.training.config")
+    dataset = _OpenPiResumeDataset()
+    sampler = torch.utils.data.DistributedSampler(
+        dataset, num_replicas=2, rank=rank, shuffle=True, seed=0
+    )
+    inner = loader_module.TorchDataLoader(
+        dataset, batch_size, sampler=sampler, seed=42, framework="pytorch"
+    )
+    return loader_module.DataLoaderImpl(
+        config_module.DataConfig(repo_id="umi-test"), inner
+    )
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("batch_size", [1, 3, 9])
+def test_openpi_resume_preserves_next_samples_when_batch_changes(rank, batch_size):
+    from rlinf.data.datasets.openpi_rlinf.official_sft_data_loader import (
+        get_openpi_sft_data_order,
+        restore_openpi_sft_iterator,
+    )
+
+    original = _make_openpi_resume_loader(rank, 1)
+    iterator = iter(original)
+    for _ in range(18):
+        next(iterator)
+    expected = torch.cat([next(iterator)[1].flatten() for _ in range(9)])
+    state = get_openpi_sft_data_order(original)
+    state.update(consumed_samples=18, data_epoch=0)
+    resumed = _make_openpi_resume_loader(rank, batch_size)
+    recovered, skipped = restore_openpi_sft_iterator(resumed, state)
+    actual = torch.cat([next(recovered)[1].flatten() for _ in range(9 // batch_size)])
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert skipped == 18 // batch_size
+
+
+@pytest.mark.parametrize("changed", ["dataset", "sampler", "unaligned", "past_epoch"])
+def test_openpi_resume_rejects_incompatible_data_order(changed):
+    from rlinf.data.datasets.openpi_rlinf.official_sft_data_loader import (
+        get_openpi_sft_data_order,
+        restore_openpi_sft_iterator,
+    )
+
+    loader = _make_openpi_resume_loader(0, 3)
+    state = get_openpi_sft_data_order(loader)
+    state.update(consumed_samples=18, data_epoch=0)
+    if changed == "dataset":
+        state["dataset_repo_id"] = "different-dataset"
+    elif changed == "sampler":
+        state["sampler"]["seed"] = 3
+    elif changed == "unaligned":
+        state["consumed_samples"] = 19
+    else:
+        state["consumed_samples"] = 63
+    with pytest.raises(ValueError):
+        restore_openpi_sft_iterator(loader, state)

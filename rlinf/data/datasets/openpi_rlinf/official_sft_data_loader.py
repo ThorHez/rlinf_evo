@@ -93,6 +93,68 @@ def is_official_openpi_sft_dataloader(data_loader: Any) -> bool:
     return getattr(data_loader, "_data_loader", None) is not None
 
 
+def get_openpi_sft_data_order(data_loader: Any) -> dict[str, Any]:
+    """Describe the sample order of an official distributed OpenPI loader."""
+    from torch.utils.data import DistributedSampler
+
+    torch_loader = data_loader._data_loader.torch_loader
+    sampler = torch_loader.sampler
+    if not isinstance(sampler, DistributedSampler):
+        raise TypeError("OpenPI cursor recovery requires a DistributedSampler.")
+    return {
+        "dataset_size": len(torch_loader.dataset),
+        "dataset_repo_id": str(data_loader.data_config().repo_id),
+        "sampler": {
+            "class": type(sampler).__name__,
+            "seed": sampler.seed,
+            "epoch": sampler.epoch,
+            "rank": sampler.rank,
+            "num_replicas": sampler.num_replicas,
+            "drop_last": sampler.drop_last,
+            "shuffle": sampler.shuffle,
+        },
+    }
+
+
+def restore_openpi_sft_iterator(
+    data_loader: Any, saved_state: dict[str, Any]
+) -> tuple[Any, int]:
+    """Replay consumed samples for a deterministic, first-epoch UMI loader.
+
+    A changed micro batch is supported when the consumed sample count is
+    divisible by its new size. Random data transforms and crossing an epoch
+    boundary require worker RNG and sampler state beyond this cursor format.
+    """
+    current = get_openpi_sft_data_order(data_loader)
+    for key in ("dataset_size", "dataset_repo_id"):
+        if current[key] != saved_state[key]:
+            raise ValueError(f"OpenPI resume data mismatch: {key}.")
+    for key, value in current["sampler"].items():
+        expected = saved_state["sampler"][key]
+        if key == "class":
+            expected = expected.rsplit(".", 1)[-1]
+        if value != expected:
+            raise ValueError(f"OpenPI resume sampler mismatch: {key}.")
+    torch_loader = data_loader._data_loader.torch_loader
+    consumed = int(saved_state["consumed_samples"])
+    batch_size = int(torch_loader.batch_size)
+    if (
+        saved_state["data_epoch"] != 0
+        or consumed < 0
+        or consumed > len(torch_loader) * batch_size
+        or consumed % batch_size
+    ):
+        raise ValueError("OpenPI resume cursor must align within the first epoch.")
+    iterator = iter(data_loader)
+    skipped_batches = consumed // batch_size
+    for _ in range(skipped_batches):
+        next(iterator)
+    generator_state = saved_state.get("loader_generator_state")
+    if generator_state is not None:
+        torch_loader.generator.set_state(generator_state)
+    return iterator, skipped_batches
+
+
 def _validate_openpi_rlinf_model_shape(model_cfg: Any, openpi_config: Any) -> None:
     """Keep the local Pi0 architecture consistent with the OpenPI config."""
     local_horizon = int(model_cfg.num_action_chunks)

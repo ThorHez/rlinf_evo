@@ -11,9 +11,9 @@ stages:
 2. Freeze that feature model and train a lightweight off-policy actor-critic
    policy using the extracted RLT state.
 
-The checked-in examples target Franka peg insertion and the ManiSkill
-``PegInsertionSideWideClearance-v1`` joint-control simulation. The pipeline is
-not tied to either task. Reuse the same two-stage structure when the
+The checked-in examples cover UMI V4 Stage 1 training, Franka peg insertion, and
+the ManiSkill ``PegInsertionSideWideClearance-v1`` joint-control simulation. Reuse
+the same two-stage structure when the
 demonstrations, environment config, action shape, state semantics, and OpenPI
 dataconfig stay aligned.
 
@@ -62,6 +62,9 @@ Provided Configuration Files
    * - Stage
      - Config
      - Purpose
+   * - UMI Stage 1
+     - ``examples/sft/config/umi_rlt_stage1_sft_openpi_pi05.yaml``
+     - Check joint Pi0.5 and RLT training on UMI V4 demonstrations with a short FP32 run.
    * - Franka Stage 1
      - ``examples/sft/config/realworld_rlt_stage1_sft_openpi_pi05.yaml``
      - SFT π₀.₅ together with the RLT token transformer on Franka demonstrations.
@@ -195,6 +198,14 @@ Important Stage 1 fields:
 
 Keep ``repo_id``, ``config_name``, and normalization stats consistent with the
 Stage 2 feature-model config. ``openpi_data`` belongs under ``actor.model``.
+
+To exclude padded action targets from the VLA objective, set
+``actor.model.openpi.action_loss_mask`` to one nonnegative weight per
+``model_action_dim``. The VLA loss divides the weighted squared-error sum by the
+weight sum, then averages over the batch and action horizon. The weights must be
+finite and have a positive sum. Omitting the mask keeps the mean over all model
+action dimensions. The same mask applies to plain SFT and RLT Stage 1; the RLT
+reconstruction objective is unchanged.
 
 .. note::
 
@@ -342,6 +353,143 @@ The BC target is the VLA reference action for normal policy steps. If a human
 intervention action is stored for a step, the BC target for that step becomes
 the human action. ManiSkill disables ``expert_takeover`` by default, so the
 default simulated route uses only the VLA reference and actor actions.
+
+Run UMI Stage 1
+---------------
+
+Use ``examples/sft/config/umi_rlt_stage1_sft_openpi_pi05.yaml`` to train the
+converted native PyTorch Pi0.5 checkpoint together with an RLT token transformer
+on UMI V4 demonstrations. The ``pi05_umi_v4`` dataconfig expects a LeRobot dataset
+whose rows already contain a 16-step, 10-dimensional action chunk.
+
+Each observation contains two 16-dimensional states and the latest left wrist
+RGB image. The loader keeps the state shape at ``(2, 16)`` while tokenizing the
+prompt and discrete state, then flattens it to 32 values. It uses the original
+checkpoint's min/max statistics to normalize only XYZ in state and actions;
+rotation and gripper values retain their original scale. Actions are padded
+from ``(16, 10)`` to ``(16, 32)`` for the model. The example's
+``action_loss_mask`` contains ten ones followed by twenty-two zeros, so the VLA
+objective averages only the ten real action dimensions.
+
+Set the dataset, converted checkpoint, and its original normalization file in
+the example before launch:
+
+.. code:: yaml
+
+   data:
+     train_data_paths: /path/to/umi_lerobot_dataset
+   actor:
+     model:
+       model_path: /path/to/pi05_umi_fp32
+       precision: fp32
+       openpi_data:
+         repo_id: umi_v4
+         norm_stats_path: /path/to/pi05_umi_fp32/assets/norm_stats.json
+       openpi:
+         config_name: pi05_umi_v4
+
+The example runs 20 optimizer steps on eight GPUs, with one sample per GPU and
+a global batch size of eight. Model parameters and FSDP communication use FP32.
+Launch it from the repository root in the OpenPI environment:
+
+.. code:: bash
+
+   bash examples/sft/run_vla_sft.sh umi_rlt_stage1_sft_openpi_pi05
+
+Use this short run to check finite ``vla_loss`` and ``rlt_loss`` and verify that
+the saved model reloads. FSDP synchronizes gradients for the FP32 image stem
+along with the other trainable VLA and RLT parameters. Compare the saved DCP
+model tensors with the full checkpoint, including ``img.stem.weight`` and
+``img.stem.bias``, to check that the replicas agree.
+The final ``actor/model_state_dict/full_weights.pt`` contains both the VLA and
+``rlt_module`` weights. Keep the complete checkpoint, resolved training config,
+and original normalization file for the Stage 2 feature model.
+
+After validating the short run, use
+``examples/sft/config/umi_rlt_stage1_sft_openpi_pi05_20k.yaml`` for 20,000 optimizer
+steps. It uses eight GPUs with a micro batch size of nine, giving a global batch
+size of 72 with one forward/backward pass per rank for each optimizer update.
+One data loader worker per rank gives eight loader workers in total.
+
+The 20k config shards parameters, gradients, and Adam state across ranks with
+``actor.fsdp_config.strategy: fsdp`` and
+``actor.fsdp_config.sharding_strategy: full_shard``. The native ``openpi_rlinf``
+model supports this FSDP1 mode for ``actor.model.openpi.task: sft``, FP32 parameter
+storage, and ``actor.model.is_lora: false``. It uses
+``actor.fsdp_config.gradient_checkpointing: true`` and
+``actor.fsdp_config.gradient_checkpointing_use_reentrant: false`` to recompute
+Gemma and SigLIP activations during backward and reduce activation memory.
+
+The 20k config uses BF16 backbone computation with FP32 training state, matching
+the precision split in the source OpenPI training pipeline. It sets
+``actor.model.precision: fp32`` and ``actor.model.openpi.compute_dtype: bf16``.
+Gemma, the SigLIP encoder and projector, and the RLT transformer compute in BF16.
+Parameters, gradients, Adam states, and FSDP communication remain FP32, as do
+the image stem, action and time projections, Gemma attention logits, and losses.
+The explicit ``compute_dtype`` option requires FP32 parameter storage; omitting
+it preserves the model's existing precision behavior.
+
+This config follows the observation and action pipeline of OpenPI-UMI's
+``pi05_umi_32d_80k_95_real_umi_batch_72_v4``. It enables the UMI V4 image augmentation
+with ``actor.model.openpi.umi_v4_image_augmentation: true`` during training.
+Following the source environment's Augmax 0.4.1 behavior, each wrist image has a 0.5
+probability of color jitter, with brightness in ``[-0.3, 0.3]``, contrast in
+``[-0.4, 0.4]``, and hue in ``[-0.1, 0.1]``; saturation remains unchanged.
+Evaluation images retain their original colors. PyTorch and JAX use different
+random-number streams, so matching seeds do not produce identical augmented
+images.
+
+The optimizer schedule is specific to RLT Stage 1: a peak learning rate of
+``1e-5``, 1,000 warmup steps, and cosine decay to ``2.5e-6`` at step 20,000.
+The source SFT config's learning-rate schedule and EMA are separate from this
+Stage 1 recipe; checkpoints contain the current VLA and RLT training weights.
+
+Set the dataset, model, and normalization paths in the 20k config. Choose cache
+and output directories with enough free space, then launch from the repository
+root in the OpenPI environment:
+
+.. code:: bash
+
+   export EMBODIED_PATH="$PWD/examples/sft"
+   export PYTHONPATH="$PWD"
+   export HF_DATASETS_CACHE=/path/to/dataset_cache
+   export JAX_PLATFORMS=cpu
+   export NVIDIA_TF32_OVERRIDE=0
+   python examples/sft/train_vla_sft.py \
+       --config-name umi_rlt_stage1_sft_openpi_pi05_20k \
+       runner.logger.log_path=/path/to/rlt_runs
+
+The command keeps the loader's JAX operations on CPU and disables TF32 for the
+PyTorch training run. It saves a complete checkpoint every 2,000 optimizer
+steps, including step 20,000. Reserve disk space for the dataset cache and all ten checkpoints;
+``runner.save_interval`` controls the interval and checkpoints are retained.
+Track ``vla_loss``, ``rlt_loss``, gradient norm, and learning rate. The VLA SFT
+worker requires a separate evaluation procedure to assess action quality and
+the learned RL token; training loss alone does not establish either result.
+
+To resume within the first pass through the dataset, the 20k config enables
+``data.save_openpi_resume_state: true``. Each checkpoint includes
+``actor/openpi_resume_state.pt`` with the consumed sample count and training RNG
+state for every rank. Set ``runner.resume_dir`` to the saved
+``checkpoints/global_step_<N>`` directory to restore these alongside the model,
+optimizer, and scheduler. Recovery replays the deterministic UMI V4 loader to
+the saved position before restoring each rank's training RNG state.
+
+Keep the dataset, deterministic loader transforms, sampler settings, and world
+size unchanged. A different micro batch size is supported when it divides the
+saved consumed sample count on every rank; adjust accumulation to retain the
+intended global batch size. This recovery format supports the first dataset
+epoch only. Changing batch grouping or compute precision can change subsequent
+random-number consumption and numerical results, so recovery does not promise
+bitwise equivalence across those changes.
+
+.. warning::
+
+   For the official OpenPI loader, restoring the data position and training RNG
+   requires the UMI V4 recovery option and its saved state file. With the option
+   disabled or the file absent, ``runner.resume_dir`` restores only model,
+   optimizer, and scheduler state, and data sampling restarts. The UMI recovery
+   format does not restore random transforms inside data loader workers.
 
 Run the Provided Franka Example
 -------------------------------

@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import datetime
 import importlib.util
 import sys
 import time
@@ -30,7 +32,7 @@ import torch
 from omegaconf import OmegaConf
 
 from rlinf.algorithms.losses import compute_ppo_critic_loss
-from rlinf.config import SupportedModel
+from rlinf.config import SupportedModel, validate_fsdp_cfg
 from rlinf.hybrid_engines.fsdp.utils import get_fsdp_wrap_policy
 from rlinf.models import get_model, register_model
 from rlinf.models.embodiment.modules.rlt_token_transformer import (
@@ -227,6 +229,826 @@ def test_reconstruct_detaches_targets_but_trains_encoder_and_decoder():
     )
     assert encoder_grad_norm > 0
     assert decoder_grad_norm > 0
+
+
+@pytest.fixture
+def tiny_openpi_checkpoint(monkeypatch, tmp_path):
+    from safetensors.torch import save_file
+
+    from rlinf.models.embodiment.openpi_rlinf import get_model as build_openpi
+    from rlinf.models.embodiment.openpi_rlinf.modules import gemma, siglip
+    from rlinf.models.embodiment.openpi_rlinf.pi0 import Pi0
+    from rlinf.models.embodiment.openpi_rlinf.pi0_config import Pi0Config
+
+    class TinySigLIP(siglip.SigLIPViT):
+        def __init__(self, **kwargs):
+            super().__init__(**{**kwargs, "variant": "mu/112"})
+
+    # Keep real attention, vision, flow matching, and RLT; reduce only capacity.
+    monkeypatch.setattr(siglip, "SigLIPViT", TinySigLIP)
+    monkeypatch.setattr(gemma, "PALIGEMMA_VOCAB_SIZE", 32)
+    precision = torch.get_float32_matmul_precision()
+    config = Pi0Config(
+        dtype="float32",
+        paligemma_variant="dummy",
+        action_expert_variant="dummy",
+        action_dim=4,
+        action_horizon=3,
+        max_token_len=2,
+        pi05=True,
+    )
+    torch.manual_seed(0)
+    save_file(Pi0(config).state_dict(), tmp_path / "model.safetensors")
+
+    def build(
+        *,
+        action_loss_mask=None,
+        use_rlt=False,
+        action_chunk=3,
+        env_dim=4,
+        umi_v4_image_augmentation=False,
+        compute_dtype=None,
+        precision="fp32",
+    ):
+        cfg = OmegaConf.create(
+            {
+                "model_path": str(tmp_path),
+                "precision": precision,
+                "pi05": True,
+                "action_dim": env_dim,
+                "num_action_chunks": action_chunk,
+                "num_steps": 10,
+                "openpi": {
+                    "task": "sft",
+                    "model_action_dim": 4,
+                    "action_horizon": 3,
+                    "max_token_len": 2,
+                    "paligemma_variant": "dummy",
+                    "action_expert_variant": "dummy",
+                    "action_loss_mask": action_loss_mask,
+                    "umi_v4_image_augmentation": umi_v4_image_augmentation,
+                    "compute_dtype": compute_dtype,
+                    "use_rlt": use_rlt,
+                    "rlt_input_dim": 64,
+                    "rlt_embed_dim": 16,
+                    "rlt_prefix_seq_len": 16,
+                    "rlt_num_layers": 1,
+                    "rlt_num_heads": 2,
+                    "rlt_image_only": False,
+                    "rlt_use_mask": True,
+                    "rlt_alpha": 0.5,
+                },
+            }
+        )
+        return build_openpi(cfg), (config.fake_obs(), config.fake_act())
+
+    yield build
+    torch.set_float32_matmul_precision(precision)
+
+
+@pytest.mark.parametrize("compute_dtype", [None, "bf16"])
+@pytest.mark.parametrize("use_rlt", [False, True])
+def test_openpi_compute_precision_preserves_fp32_training_state(
+    tiny_openpi_checkpoint, compute_dtype, use_rlt
+):
+    model, batch = tiny_openpi_checkpoint(compute_dtype=compute_dtype, use_rlt=use_rlt)
+    expected_backbone_dtype = (
+        torch.bfloat16 if compute_dtype == "bf16" else torch.float32
+    )
+    observed = {}
+
+    def record(name):
+        def hook(module, inputs, output):
+            del module
+            tensor = output[0] if isinstance(output, tuple) else output
+            observed[name] = (inputs[0].dtype, tensor.dtype)
+
+        return hook
+
+    targets = {
+        "stem": model.img.stem,
+        "vision_attention": model.img.encoder.layers[0].attn,
+        "vision_projector": model.img.head,
+        "language_query": model.llm.layers[0].attn.q_proj[0],
+        "language_mlp": model.llm.layers[0].mlps[0],
+        "action_input": model.action_in_proj,
+        "time_input": model.time_mlp_in,
+        "action_output": model.action_out_proj,
+    }
+    if use_rlt:
+        targets["rlt_attention"] = model.rlt_module.encoder.layers[0].self_attn
+    handles = [
+        module.register_forward_hook(record(name)) for name, module in targets.items()
+    ]
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    try:
+        output = model(data=batch)
+        loss = output["loss"] if use_rlt else output
+        assert loss.dtype == torch.float32
+        assert torch.isfinite(loss)
+        loss.backward()
+        optimizer.step()
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    for name in ("stem", "action_input", "time_input", "action_output"):
+        assert observed[name] == (torch.float32, torch.float32)
+    for name in (
+        "vision_attention",
+        "vision_projector",
+        "language_query",
+        "language_mlp",
+    ):
+        assert observed[name] == (expected_backbone_dtype, expected_backbone_dtype)
+    if use_rlt:
+        assert observed["rlt_attention"][1] == expected_backbone_dtype
+        assert output["rlt_loss"].dtype == output["vla_loss"].dtype == torch.float32
+    assert all(parameter.dtype == torch.float32 for parameter in model.parameters())
+    gradients = [
+        parameter.grad for parameter in model.parameters() if parameter.grad is not None
+    ]
+    assert gradients
+    assert all(
+        gradient.dtype == torch.float32 and torch.isfinite(gradient).all()
+        for gradient in gradients
+    )
+    states = [
+        value
+        for state in optimizer.state.values()
+        for value in state.values()
+        if torch.is_tensor(value)
+    ]
+    assert states
+    assert all(
+        value.dtype == torch.float32 and torch.isfinite(value).all() for value in states
+    )
+
+
+def test_openpi_compute_precision_rejects_reduced_parameter_storage(
+    tiny_openpi_checkpoint,
+):
+    with pytest.raises(ValueError, match="compute_dtype requires precision=fp32"):
+        tiny_openpi_checkpoint(compute_dtype="bf16", precision="bf16")
+
+
+def _openpi_full_shard_actor_config(**overrides):
+    cfg = OmegaConf.create(
+        {
+            "training_backend": "fsdp",
+            "model": {
+                "model_type": "openpi_rlinf",
+                "precision": "fp32",
+                "is_lora": False,
+                "openpi": {"task": "sft", "compute_dtype": "bf16"},
+            },
+            "fsdp_config": {
+                "strategy": "fsdp",
+                "sharding_strategy": "full_shard",
+                "mixed_precision": {
+                    "param_dtype": "fp32",
+                    "reduce_dtype": "fp32",
+                    "buffer_dtype": "fp32",
+                },
+            },
+        }
+    )
+    for key, value in overrides.items():
+        OmegaConf.update(cfg, key, value)
+    return cfg
+
+
+@pytest.mark.parametrize("compute_dtype", [None, "fp32", "bf16"])
+def test_openpi_native_sft_fp32_master_allows_full_shard(compute_dtype):
+    cfg = _openpi_full_shard_actor_config(
+        **{"model.openpi.compute_dtype": compute_dtype}
+    )
+    result = validate_fsdp_cfg(cfg)
+    assert result.fsdp_config.sharding_strategy == "full_shard"
+    assert result.model.precision == "fp32"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"model.openpi.task": "rl"},
+        {"model.openpi.task": "dsrl"},
+        {"model.openpi.task": "eval"},
+        {"model.openpi.task": "dagger"},
+        {"model.precision": "bf16"},
+        {"model.precision": "fp16"},
+        {"model.is_lora": True},
+        {"training_backend": "fsdp2"},
+        {"fsdp_config.strategy": "fsdp2"},
+        {"fsdp_config.sharding_strategy": "shard_grad_op"},
+        {"fsdp_config.sharding_strategy": "hybrid_shard"},
+    ],
+)
+def test_openpi_full_shard_rejects_unvalidated_paths(overrides):
+    with pytest.raises(AssertionError, match="full_shard requires"):
+        validate_fsdp_cfg(_openpi_full_shard_actor_config(**overrides))
+
+
+def test_openpi_full_shard_keeps_fsdp_mixed_precision_guard():
+    cfg = _openpi_full_shard_actor_config(
+        **{"fsdp_config.mixed_precision.param_dtype": "bf16"}
+    )
+    with pytest.raises(AssertionError, match="does not support FSDP mixed precision"):
+        validate_fsdp_cfg(cfg)
+
+
+@pytest.mark.parametrize("task", ["sft", "rl", "dsrl", "eval", "dagger"])
+def test_openpi_existing_no_shard_paths_remain_accepted(task):
+    cfg = _openpi_full_shard_actor_config(
+        **{
+            "fsdp_config.sharding_strategy": "no_shard",
+            "model.openpi.task": task,
+        }
+    )
+    assert validate_fsdp_cfg(cfg).fsdp_config.sharding_strategy == "no_shard"
+
+
+def _activate_tiny_openpi_trunk(model):
+    # Tiny random checkpoints start with zero vision output and expert gates.
+    # Nonzero values exercise gradients through both experts and the image stem.
+    with torch.no_grad():
+        model.img.head.weight.normal_(std=0.02)
+        for name, parameter in model.named_parameters():
+            if name.endswith("ada_modulation.bias"):
+                parameter.add_(0.1)
+
+
+@pytest.mark.parametrize("compute_dtype", [None, "bf16"])
+@pytest.mark.parametrize("use_rlt", [False, True])
+def test_openpi_gradient_checkpointing_preserves_sft_training(
+    tiny_openpi_checkpoint, compute_dtype, use_rlt
+):
+    baseline, batch = tiny_openpi_checkpoint(
+        compute_dtype=compute_dtype,
+        use_rlt=use_rlt,
+        umi_v4_image_augmentation=True,
+    )
+    _activate_tiny_openpi_trunk(baseline)
+    checkpointed = copy.deepcopy(baseline)
+    checkpointed.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False}
+    )
+    results = []
+    for model in (baseline, checkpointed):
+        calls = {"vision": 0, "language": 0}
+
+        def count(name):
+            def hook(module, inputs):
+                del module, inputs
+                calls[name] += 1
+
+            return hook
+
+        handles = [
+            model.img.encoder.layers[0].register_forward_pre_hook(count("vision")),
+            model.llm.layers[0].register_forward_pre_hook(count("language")),
+        ]
+        saved_elements = 0
+
+        def pack(tensor):
+            nonlocal saved_elements
+            saved_elements += tensor.numel()
+            return tensor
+
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+        torch.manual_seed(37)
+        try:
+            with torch.autograd.graph.saved_tensors_hooks(pack, lambda x: x):
+                output = model(data=batch)
+                forward_calls = calls.copy()
+                loss = output["loss"] if use_rlt else output
+                loss.backward()
+            assert model.img.stem.weight.grad.abs().sum() > 0
+            gradients = {
+                name: None if parameter.grad is None else parameter.grad.clone()
+                for name, parameter in model.named_parameters()
+            }
+            optimizer.step()
+            results.append(
+                {
+                    "output": output,
+                    "gradients": gradients,
+                    "parameters": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "rng": torch.get_rng_state(),
+                    "saved_elements": saved_elements,
+                }
+            )
+        finally:
+            for handle in handles:
+                handle.remove()
+        if model is checkpointed:
+            assert all(calls[name] > forward_calls[name] for name in calls)
+        else:
+            assert calls == forward_calls
+
+    assert results[1]["saved_elements"] < results[0]["saved_elements"]
+    for key in ("output", "gradients", "parameters", "optimizer", "rng"):
+        torch.testing.assert_close(results[0][key], results[1][key], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("compute_dtype", [None, "bf16"])
+def test_openpi_gradient_checkpointing_preserves_cached_suffix(
+    tiny_openpi_checkpoint, compute_dtype
+):
+    baseline, (observation, actions) = tiny_openpi_checkpoint(
+        compute_dtype=compute_dtype
+    )
+    _activate_tiny_openpi_trunk(baseline)
+    checkpointed = copy.deepcopy(baseline)
+    checkpointed.gradient_checkpointing_enable()
+    results = []
+    for model in (baseline, checkpointed):
+        prefix, mask, cache = model.build_prefix_cache(observation)
+        assert len(cache) == len(model.llm.layers)
+        assert prefix.shape[:2] == mask.shape
+        suffix = model.run_suffix(
+            observation, actions, torch.full((1,), 0.5), cache, mask
+        )
+        velocity = model.velocity_from_suffix(suffix)
+        velocity.square().mean().backward()
+        results.append(
+            (
+                prefix,
+                cache,
+                velocity,
+                {name: parameter.grad for name, parameter in model.named_parameters()},
+            )
+        )
+    torch.testing.assert_close(results[0], results[1], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("compute_dtype", [None, "bf16"])
+def test_openpi_checkpointed_rlt_loss_detaches_vla(
+    tiny_openpi_checkpoint, compute_dtype
+):
+    model, batch = tiny_openpi_checkpoint(compute_dtype=compute_dtype, use_rlt=True)
+    model.gradient_checkpointing_enable()
+    output = model(data=batch)
+    output["rlt_loss"].backward()
+    assert all(
+        parameter.grad is None
+        for name, parameter in model.named_parameters()
+        if not name.startswith("rlt_module.")
+    )
+    for module in (model.rlt_module.encoder, model.rlt_module.decoder):
+        assert any(
+            parameter.grad is not None and parameter.grad.abs().sum() > 0
+            for parameter in module.parameters()
+        )
+
+
+def test_openpi_rejects_reentrant_gradient_checkpointing(tiny_openpi_checkpoint):
+    model, _ = tiny_openpi_checkpoint()
+    with pytest.raises(ValueError, match="requires non-reentrant"):
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": True}
+        )
+
+
+def test_umi_v4_color_jitter_matches_source_augmax():
+    augmax = pytest.importorskip("augmax")
+    jax = pytest.importorskip("jax")
+    from rlinf.models.embodiment.openpi_rlinf.modules.model import (
+        apply_umi_v4_color_jitter,
+    )
+
+    jitter = augmax.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5)
+    images = np.random.default_rng(41).random((16, 2, 4, 3), dtype=np.float32)
+    images[:, 0, 0] = 0
+    images[:, 0, 1] = 1
+    images[:, 0, 2] = 0.5
+    keys = jax.random.split(jax.random.key(7), len(images))
+    parameters = []
+    reference = []
+    for key, image in zip(keys, images):
+        subkeys = jax.random.split(key, jitter.keys_needed)
+        parameters.append(
+            [
+                float(jax.random.uniform(subkeys[0], minval=-0.3, maxval=0.3)),
+                float(jax.random.uniform(subkeys[1], minval=-0.4, maxval=0.4)),
+                float(jax.random.uniform(subkeys[2], minval=-0.1, maxval=0.1)),
+                bool(jax.random.bernoulli(key, 0.5)),
+            ]
+        )
+        reference.append(np.asarray(jitter(key, image)))
+    parameters = torch.tensor(parameters)
+    actual = apply_umi_v4_color_jitter(
+        torch.from_numpy(images),
+        parameters[:, 0],
+        parameters[:, 1],
+        parameters[:, 2],
+        parameters[:, 3].bool(),
+    )
+    torch.testing.assert_close(
+        actual, torch.from_numpy(np.stack(reference)), atol=2e-6, rtol=2e-6
+    )
+
+
+def test_umi_v4_augmentation_uses_seeded_rng_and_preserves_evaluation():
+    from rlinf.models.embodiment.openpi_rlinf.modules.model import (
+        Observation,
+        preprocess_observation,
+    )
+
+    image = torch.tensor([0.2, 0.4, 0.8]).expand(256, 8, 8, 3).clone() * 2 - 1
+    observation = Observation(
+        images=dict.fromkeys(
+            ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"), image
+        ),
+        image_masks={
+            "base_0_rgb": torch.zeros(256, dtype=torch.bool),
+            "left_wrist_0_rgb": torch.ones(256, dtype=torch.bool),
+            "right_wrist_0_rgb": torch.zeros(256, dtype=torch.bool),
+        },
+        state=torch.zeros(256, 32),
+    )
+    kwargs = {"image_resolution": (8, 8), "umi_v4_image_augmentation": True}
+    torch.manual_seed(19)
+    first = preprocess_observation(observation, train=True, **kwargs)
+    torch.manual_seed(19)
+    repeated = preprocess_observation(observation, train=True, **kwargs)
+    torch.testing.assert_close(
+        first.images["left_wrist_0_rgb"],
+        repeated.images["left_wrist_0_rgb"],
+        rtol=0,
+        atol=0,
+    )
+    changed = (first.images["left_wrist_0_rgb"] - image).abs().amax(
+        dim=(1, 2, 3)
+    ) > 1e-6
+    assert 90 < changed.sum() < 170
+    assert first.images["left_wrist_0_rgb"].unique(dim=0).shape[0] > 90
+    for key in ("base_0_rgb", "right_wrist_0_rgb"):
+        torch.testing.assert_close(first.images[key], image, rtol=0, atol=0)
+    evaluated = preprocess_observation(observation, train=False, **kwargs)
+    for key in observation.images:
+        torch.testing.assert_close(evaluated.images[key], image, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("use_rlt", [False, True])
+def test_openpi_sft_uses_umi_v4_augmentation(tiny_openpi_checkpoint, use_rlt):
+    from rlinf.models.embodiment.base_policy import ForwardType
+    from rlinf.models.embodiment.openpi_rlinf.modules.model import (
+        preprocess_observation,
+    )
+
+    model, (observation, actions) = tiny_openpi_checkpoint(
+        use_rlt=use_rlt, umi_v4_image_augmentation=True
+    )
+    image = torch.linspace(-1, 1, 224 * 224 * 3).reshape(1, 224, 224, 3)
+    observation.images["left_wrist_0_rgb"] = image
+    torch.manual_seed(2)
+    expected = preprocess_observation(
+        observation, train=True, umi_v4_image_augmentation=True
+    ).images["left_wrist_0_rgb"]
+    assert not torch.allclose(expected, image)
+    captured = []
+    handle = model.img.register_forward_pre_hook(
+        lambda _, args: captured.append(args[0].detach().clone())
+    )
+    try:
+        torch.manual_seed(2)
+        model(ForwardType.SFT, data=(observation, actions))
+    finally:
+        handle.remove()
+    torch.testing.assert_close(captured[1], expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("use_rlt", [False, True])
+def test_openpi_sft_action_mask_excludes_padded_output_gradients(
+    tiny_openpi_checkpoint, use_rlt
+):
+    from rlinf.models.embodiment.base_policy import ForwardType
+
+    model, batch = tiny_openpi_checkpoint(
+        action_loss_mask=[1.0, 2.0, 0.0, 0.0], use_rlt=use_rlt
+    )
+    torch.manual_seed(42)
+    per_element_loss = model.compute_loss(*batch, train=True)
+    expected = (per_element_loss[..., 0] + 2 * per_element_loss[..., 1]).mean() / 3
+
+    torch.manual_seed(42)
+    output = model(forward_type=ForwardType.SFT, data=batch)
+    vla_loss = output["vla_loss"] if use_rlt else output
+    loss = output["loss"] if use_rlt else output
+    torch.testing.assert_close(vla_loss, expected)
+    if use_rlt:
+        torch.testing.assert_close(loss, output["rlt_loss"] + 0.5 * vla_loss)
+    loss.backward()
+    projection_grad = model.action_out_proj.weight.grad.clone()
+    assert torch.count_nonzero(projection_grad[:2]) > 0
+    assert torch.count_nonzero(projection_grad[2:]) == 0
+    assert torch.count_nonzero(model.action_out_proj.bias.grad[2:]) == 0
+    if use_rlt:
+        assert any(
+            parameter.grad is not None and torch.count_nonzero(parameter.grad) > 0
+            for parameter in model.rlt_module.encoder.parameters()
+        )
+
+    # Changes only to excluded outputs must preserve both loss and valid gradients.
+    model.zero_grad(set_to_none=True)
+    with torch.no_grad():
+        model.action_out_proj.bias[2:] += 100.0
+    torch.manual_seed(42)
+    changed_output = model(forward_type=ForwardType.SFT, data=batch)
+    changed_loss = changed_output["loss"] if use_rlt else changed_output
+    torch.testing.assert_close(changed_loss, loss)
+    changed_loss.backward()
+    torch.testing.assert_close(model.action_out_proj.weight.grad, projection_grad)
+
+
+@pytest.mark.parametrize("use_action_chunk_loss", [False, True])
+def test_openpi_sft_without_action_mask_preserves_loss(
+    tiny_openpi_checkpoint, use_action_chunk_loss
+):
+    from rlinf.models.embodiment.base_policy import ForwardType
+
+    model, batch = tiny_openpi_checkpoint(action_chunk=2, env_dim=2)
+    torch.manual_seed(42)
+    expected = model.compute_loss(*batch, train=True)
+    if use_action_chunk_loss:
+        expected = expected[:, :2, :2]
+    torch.manual_seed(42)
+    loss = model(
+        forward_type=ForwardType.SFT,
+        data=batch,
+        use_action_chunk_loss=use_action_chunk_loss,
+    )
+    torch.testing.assert_close(loss, expected.mean())
+
+
+def test_openpi_sft_action_mask_respects_dagger_chunk(tiny_openpi_checkpoint):
+    from rlinf.models.embodiment.base_policy import ForwardType
+
+    model, batch = tiny_openpi_checkpoint(
+        action_loss_mask=[1.0, 0.0, 2.0, 0.0], action_chunk=2, env_dim=2
+    )
+    torch.manual_seed(42)
+    expected = model.compute_loss(*batch, train=True)[:, :2, 0].mean()
+    torch.manual_seed(42)
+    loss = model(forward_type=ForwardType.SFT, data=batch, use_action_chunk_loss=True)
+    torch.testing.assert_close(loss, expected)
+    loss.backward()
+    assert torch.count_nonzero(model.action_out_proj.weight.grad[0]) > 0
+    assert torch.count_nonzero(model.action_out_proj.weight.grad[1:]) == 0
+
+
+def test_openpi_sft_action_mask_rejects_empty_dagger_overlap(tiny_openpi_checkpoint):
+    from rlinf.models.embodiment.base_policy import ForwardType
+
+    model, batch = tiny_openpi_checkpoint(
+        action_loss_mask=[0.0, 0.0, 1.0, 0.0], env_dim=2
+    )
+    with pytest.raises(ValueError, match="no positive weights"):
+        model(forward_type=ForwardType.SFT, data=batch, use_action_chunk_loss=True)
+
+
+@pytest.mark.parametrize(
+    "mask",
+    [
+        (1.0, 0.0),
+        (0.0, 0.0, 0.0, 0.0),
+        (1.0, -1.0, 0.0, 0.0),
+        (1.0, float("nan"), 0.0, 0.0),
+        (1.0, float("inf"), 0.0, 0.0),
+    ],
+)
+def test_openpi_config_rejects_invalid_action_loss_mask(mask):
+    from rlinf.models.embodiment.openpi_rlinf.pi0_config import Pi0Config
+
+    with pytest.raises(ValueError, match="action_loss_mask"):
+        Pi0Config(action_dim=4, action_loss_mask=mask)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("autocast", [False, True])
+def test_siglip_stem_preserves_float32_convolution_and_gradients(dtype, autocast):
+    from rlinf.models.embodiment.openpi_rlinf.modules.siglip import SigLIPViT
+
+    torch.manual_seed(42)
+    stem = SigLIPViT(variant="mu/14").get_submodule("stem").to(dtype=dtype)
+    image = torch.randn(2, 3, 28, 42, dtype=dtype, requires_grad=True)
+    reference_image = image.detach().clone().requires_grad_()
+    reference_weight = stem.weight.detach().clone().requires_grad_()
+    reference_bias = stem.bias.detach().clone().requires_grad_()
+    expected = torch.nn.functional.conv2d(
+        reference_image.float(),
+        reference_weight.float(),
+        reference_bias.float(),
+        stride=stem.stride,
+        padding=stem.padding,
+    )
+    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
+        actual = stem(image)
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    target = torch.randn_like(expected)
+    (actual * target).sum().backward()
+    (expected * target).sum().backward()
+    for actual_grad, expected_grad in (
+        (image.grad, reference_image.grad),
+        (stem.weight.grad, reference_weight.grad),
+        (stem.bias.grad, reference_bias.grad),
+    ):
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
+
+
+def _run_fsdp_siglip_replica_check(rank, init_path):
+    from torch.distributed.fsdp import (
+        FullyShardedDataParallel as FSDP,
+    )
+    from torch.distributed.fsdp import (
+        ShardingStrategy,
+    )
+
+    from rlinf.models.embodiment.openpi_rlinf.modules.siglip import SigLIPViT
+
+    class VisionPolicy(torch.nn.Module):
+        _no_split_modules = ["SigLIPViT", "Encoder", "Encoder1DBlock"]
+        _no_split_names = ["stem", "head"]
+
+        def __init__(self):
+            super().__init__()
+            self.img = SigLIPViT(variant="mu/112", num_classes=16)
+            torch.nn.init.normal_(self.img.head.weight, std=0.02)
+            for name, module in self.named_modules():
+                module._fsdp_wrap_name = name.rsplit(".", 1)[-1]
+
+        def forward(self, images):
+            # Pi0 reuses the same encoder for its three camera slots.
+            return (
+                sum(
+                    self.img(images + camera * 0.1)[0].square().mean()
+                    for camera in range(3)
+                )
+                / 3
+            )
+
+    torch.cuda.set_device(rank)
+    torch.distributed.init_process_group(
+        "nccl",
+        init_method=f"file://{init_path}",
+        rank=rank,
+        world_size=2,
+        timeout=datetime.timedelta(seconds=120),
+    )
+    try:
+        torch.manual_seed(42)
+        policy = VisionPolicy().cuda(rank)
+        initial_stem = policy.img.stem.weight.detach().clone()
+        wrap_policy = get_fsdp_wrap_policy(
+            module=policy,
+            config=OmegaConf.create({"use_orig_params": False}),
+            is_lora=False,
+            model_type="openpi_rlinf",
+        )
+        wrapped = FSDP(
+            policy,
+            auto_wrap_policy=wrap_policy,
+            sharding_strategy=ShardingStrategy.NO_SHARD,
+            device_id=rank,
+            sync_module_states=True,
+            use_orig_params=False,
+        )
+        optimizer = torch.optim.AdamW(wrapped.parameters(), lr=1e-3, fused=True)
+        torch.manual_seed(100 + rank)
+        for _ in range(2):
+            images = torch.randn(1, 224, 224, 3, device=f"cuda:{rank}")
+            optimizer.zero_grad(set_to_none=True)
+            wrapped(images).backward()
+            torch.nn.utils.clip_grad_norm_(wrapped.parameters(), max_norm=1.0)
+            optimizer.step()
+
+        state = wrapped.state_dict()
+        assert not torch.equal(state["img.stem.weight"], initial_stem)
+        for name in ("img.stem.weight", "img.stem.bias", "img.head.weight"):
+            value = state[name].contiguous()
+            replicas = [torch.empty_like(value) for _ in range(2)]
+            torch.distributed.all_gather(replicas, value)
+            torch.testing.assert_close(
+                replicas[0], replicas[1], rtol=0, atol=0, msg=f"Unsynced {name}"
+            )
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires two CUDA GPUs.")
+def test_siglip_fsdp_no_shard_keeps_replicas_equal(tmp_path):
+    torch.multiprocessing.spawn(
+        _run_fsdp_siglip_replica_check,
+        args=(str(tmp_path / "process_group"),),
+        nprocs=2,
+        join=True,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires one CUDA GPU.")
+@pytest.mark.parametrize("fsdp_version", ["fsdp", "fsdp2"])
+@pytest.mark.parametrize("cpu_offload", [False, True])
+def test_fsdp_checkpoint_restore_releases_old_optimizer_buffers(
+    tmp_path, fsdp_version, cpu_offload
+):
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint.state_dict import StateDictOptions
+
+    from rlinf.hybrid_engines.fsdp import FSDP, ShardingStrategy, fully_shard
+    from rlinf.hybrid_engines.fsdp.strategy.checkpoint import Checkpoint
+    from rlinf.hybrid_engines.fsdp.utils import FSDPVersion, to_local_if_dtensor
+
+    torch.cuda.set_device(0)
+    torch.distributed.init_process_group(
+        "nccl",
+        init_method=f"file://{tmp_path / 'process_group'}",
+        rank=0,
+        world_size=1,
+        timeout=datetime.timedelta(seconds=120),
+    )
+    try:
+        torch.manual_seed(12)
+        model = torch.nn.Sequential(
+            torch.nn.Linear(16, 32), torch.nn.Tanh(), torch.nn.Linear(32, 4)
+        ).cuda()
+        if fsdp_version == "fsdp":
+            model = FSDP(
+                model, sharding_strategy=ShardingStrategy.NO_SHARD, device_id=0
+            )
+        else:
+            fully_shard(model)
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=1e-3, fused=fsdp_version == "fsdp"
+        )
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.5)
+        inputs = torch.randn(4, 16, device="cuda")
+
+        def train_step():
+            optimizer.zero_grad(set_to_none=True)
+            model(inputs).square().mean().backward()
+            optimizer.step()
+            scheduler.step()
+
+        def snapshot():
+            return (
+                {
+                    name: to_local_if_dtensor(value).detach().cpu().clone()
+                    for name, value in model.state_dict().items()
+                },
+                [
+                    {
+                        name: to_local_if_dtensor(value).detach().cpu().clone()
+                        for name, value in state.items()
+                    }
+                    for state in optimizer.state.values()
+                ],
+                scheduler.state_dict(),
+            )
+
+        for _ in range(3):
+            train_step()
+        checkpoint = Checkpoint(
+            model,
+            optimizer,
+            scheduler,
+            StateDictOptions(cpu_offload=cpu_offload, full_state_dict=False),
+            FSDPVersion(fsdp_version),
+        )
+        dcp.save({"actor": checkpoint}, checkpoint_id=tmp_path / "checkpoint")
+        saved = snapshot()
+        train_step()
+        uninterrupted = snapshot()
+        train_step()
+
+        old_state_devices = []
+        unexpected_steps = []
+
+        def inspect_old_state(opt, state_dict):
+            assert opt.state
+            old_state_devices.extend(
+                state["exp_avg"].device.type for state in opt.state.values()
+            )
+
+        load_hook = optimizer.register_load_state_dict_pre_hook(inspect_old_state)
+        step_hook = optimizer.register_step_pre_hook(
+            lambda *args: unexpected_steps.append(True)
+        )
+        try:
+            dcp.load({"actor": checkpoint}, checkpoint_id=tmp_path / "checkpoint")
+        finally:
+            load_hook.remove()
+            step_hook.remove()
+        assert old_state_devices
+        assert set(old_state_devices) == {"cpu" if cpu_offload else "cuda"}
+        assert not unexpected_steps
+        torch.testing.assert_close(snapshot(), saved, rtol=0, atol=0)
+        train_step()
+        torch.testing.assert_close(snapshot(), uninterrupted, rtol=0, atol=0)
+    finally:
+        torch.distributed.destroy_process_group()
 
 
 class _FakeValueExpert:

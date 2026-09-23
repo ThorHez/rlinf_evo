@@ -21,6 +21,7 @@ subclasses (eval / RL / DAgger / DSRL) inherit this module.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any, Sequence
 
@@ -101,7 +102,9 @@ class Pi0(model.BaseModel):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
         self.pcd = config.pcd
-        self.embed_dtype = _str_to_dtype(config.dtype)
+        compute_dtype = config.compute_dtype or config.dtype
+        self.embed_dtype = _str_to_dtype(compute_dtype)
+        self.use_compute_autocast = config.compute_dtype == "bfloat16"
         self._config = config
 
         paligemma_config = gemma.get_config(config.paligemma_variant)
@@ -112,9 +115,10 @@ class Pi0(model.BaseModel):
         adarms = [False, config.pi05]
         self.llm = gemma.Module(
             configs=[paligemma_config, action_expert_config],
-            embed_dtype=config.dtype,
+            embed_dtype=compute_dtype,
             adarms=adarms,
             use_gradient_checkpointing=False,
+            use_compute_autocast=self.use_compute_autocast,
         )
 
         # SigLIP vision encoder
@@ -123,7 +127,8 @@ class Pi0(model.BaseModel):
             pool_type="none",
             num_classes=paligemma_config.width,
             use_gradient_checkpointing=False,
-            dtype_mm=config.dtype,
+            dtype_mm=compute_dtype,
+            use_compute_autocast=self.use_compute_autocast,
         )
 
         action_expert_width = action_expert_config.width
@@ -354,12 +359,17 @@ class Pi0(model.BaseModel):
         B = actions.shape[0]
         device = actions.device
 
-        # Preprocess first (requires float32 for image ops), then cast the
-        # observation to embed_dtype for Gemma / SigLIP. Keep actions in
-        # fp32 like the RL sampler: action / time projections stay fp32.
-        observation = model.preprocess_observation(observation, train=train, rng=rng)
+        # Keep images and action/time projections in FP32. Explicit compute
+        # precision casts only backbone activations, preserving FP32 state too.
+        observation = model.preprocess_observation(
+            observation,
+            train=train,
+            rng=rng,
+            umi_v4_image_augmentation=self._config.umi_v4_image_augmentation,
+        )
 
-        observation = model._observation_to_dtype(observation, self.embed_dtype)
+        if self._config.compute_dtype is None:
+            observation = model._observation_to_dtype(observation, self.embed_dtype)
         actions = actions.to(dtype=torch.float32)
         dtype = actions.dtype
 
@@ -682,7 +692,8 @@ class Pi0(model.BaseModel):
         rlt_param = next(self.rlt_module.parameters())
         prefix_output = prefix_output.to(device=rlt_param.device, dtype=rlt_param.dtype)
         rlt_mask = prefix_mask if self.rlt_cfg.rlt_use_mask else None
-        return self.rlt_module(prefix_output, rlt_mask)
+        with self._compute_autocast(prefix_output.device):
+            return self.rlt_module(prefix_output, rlt_mask)
 
     def _encode_rlt_flat(
         self,
@@ -693,7 +704,13 @@ class Pi0(model.BaseModel):
         rlt_param = next(self.rlt_module.parameters())
         prefix_output = prefix_output.to(device=rlt_param.device, dtype=rlt_param.dtype)
         rlt_mask = prefix_mask if self.rlt_cfg.rlt_use_mask else None
-        return self.rlt_module.encode_flat(prefix_output, rlt_mask)
+        with self._compute_autocast(prefix_output.device):
+            return self.rlt_module.encode_flat(prefix_output, rlt_mask)
+
+    def _compute_autocast(self, device: torch.device):
+        if self.use_compute_autocast:
+            return torch.autocast(device.type, dtype=self.embed_dtype)
+        return nullcontext()
 
     @staticmethod
     def _unpack_sft_batch(data: Any) -> tuple[Any, Any]:
@@ -753,11 +770,12 @@ class Pi0(model.BaseModel):
     def _reduce_sft_loss(
         self, per_element_loss: torch.Tensor, use_action_chunk_loss: bool
     ) -> torch.Tensor:
-        """Mean flow-matching MSE, optionally restricted to the env action chunk.
+        """Reduce flow-matching MSE over the configured action dimensions.
 
         ``per_element_loss`` is ``[B, action_horizon, action_dim]``. DAgger
         matches the old OpenPI wrapper by dropping padded action dims and
-        unexecuted horizon steps before the mean.
+        unexecuted horizon steps first. An explicit ``action_loss_mask`` then
+        weights the retained dimensions, normalized by their weight sum.
         """
         if use_action_chunk_loss:
             horizon = (
@@ -771,6 +789,16 @@ class Pi0(model.BaseModel):
                 else per_element_loss.shape[-1]
             )
             per_element_loss = per_element_loss[:, :horizon, :env_dim]
+        if self._config.action_loss_mask is not None:
+            weights = self._config.action_loss_mask[: per_element_loss.shape[-1]]
+            weight_sum = sum(weights)
+            if weight_sum <= 0:
+                raise ValueError(
+                    "action_loss_mask has no positive weights in the selected "
+                    "environment action dimensions."
+                )
+            mask = per_element_loss.new_tensor(weights)
+            return ((per_element_loss * mask).sum(dim=-1) / weight_sum).mean()
         return per_element_loss.mean()
 
     def _sft_forward_with_rlt_prefix(
@@ -782,8 +810,13 @@ class Pi0(model.BaseModel):
         batch_size = actions.shape[0]
         device = actions.device
 
-        observation = model.preprocess_observation(observation, train=True)
-        observation = model._observation_to_dtype(observation, self.embed_dtype)
+        observation = model.preprocess_observation(
+            observation,
+            train=True,
+            umi_v4_image_augmentation=self._config.umi_v4_image_augmentation,
+        )
+        if self._config.compute_dtype is None:
+            observation = model._observation_to_dtype(observation, self.embed_dtype)
         actions = actions.to(dtype=torch.float32)
         dtype = actions.dtype
 
@@ -826,8 +859,6 @@ class Pi0(model.BaseModel):
     ) -> torch.Tensor | dict[str, torch.Tensor]:
         """Flow-matching SFT loss. Shared by SFT, DAgger, and PPO co-train."""
         del kwargs
-        if hasattr(self, "gradient_checkpointing_disable"):
-            self.gradient_checkpointing_disable()
         observation, actions = self._unpack_sft_batch(data)
         observation = self._observation_to_device(observation)
         actions = self._actions_to_device(actions)
@@ -922,12 +953,17 @@ class Pi0(model.BaseModel):
         """Enable gradient checkpointing for memory efficiency.
 
         Args:
-            gradient_checkpointing_kwargs: Optional kwargs forwarded to the activation
-                checkpoint. Currently honors ``use_reentrant`` (default ``False``), so
-                the FSDP ``gradient_checkpointing_use_reentrant`` setting is respected.
+            gradient_checkpointing_kwargs: Checkpoint options. ``use_reentrant``
+                must be ``False`` because the dual-expert backbone passes nested
+                tensors and optional KV caches through each checkpoint.
         """
         kwargs = gradient_checkpointing_kwargs or {}
         use_reentrant = kwargs.get("use_reentrant", False)
+        if use_reentrant:
+            raise ValueError(
+                "Pi0 requires non-reentrant gradient checkpointing; set "
+                "gradient_checkpointing_use_reentrant=False."
+            )
         self.llm.gradient_checkpointing = True
         self.llm.gradient_checkpointing_use_reentrant = use_reentrant
         self.img.encoder.gradient_checkpointing = True

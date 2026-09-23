@@ -80,6 +80,7 @@ FSDP/FSDP2 检查点文件结构如下：
 
 FSDP/FSDP2 通过 DCP (torch.distributed.checkpoint) 保存和加载检查点，其结果为一组分布式检查点文件(.distcp)。  
 每个文件包含模型参数、优化器状态和 RNG 状态的分片。
+使用 CPU offload 恢复 DCP 检查点时，已初始化的 optimizer 状态会先移到主机内存，再加载检查点中的状态，从而降低 GPU 显存峰值，并保留 optimizer 的步数和动量。
 
 
 恢复训练

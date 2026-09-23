@@ -41,6 +41,7 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
     """
     import pathlib
 
+    import torch
     from omegaconf import OmegaConf
 
     from rlinf.models.embodiment.openpi_rlinf.pi0 import Pi0
@@ -89,7 +90,20 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
         "action_expert_variant": str(model_cfg.action_expert_variant),
         "dtype": _pi0_dtype_name(target_dtype),
         "pcd": False,
+        "umi_v4_image_augmentation": bool(
+            OmegaConf.select(model_cfg, "umi_v4_image_augmentation", default=False)
+        ),
     }
+    compute_dtype = OmegaConf.select(model_cfg, "compute_dtype", default=None)
+    if compute_dtype is not None:
+        if target_dtype != torch.float32:
+            raise ValueError(
+                "openpi.compute_dtype requires precision=fp32 so parameters and "
+                "optimizer state remain in float32."
+            )
+        pi0_kwargs["compute_dtype"] = _pi0_dtype_name(
+            torch_dtype_from_precision(compute_dtype)
+        )
     discrete_state_input = OmegaConf.select(
         model_cfg, "discrete_state_input", default=None
     )
@@ -98,6 +112,11 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
     max_token_len = OmegaConf.select(model_cfg, "max_token_len", default=None)
     if max_token_len is not None:
         pi0_kwargs["max_token_len"] = int(max_token_len)
+    action_loss_mask = OmegaConf.select(model_cfg, "action_loss_mask", default=None)
+    if action_loss_mask is not None:
+        pi0_kwargs["action_loss_mask"] = tuple(
+            float(weight) for weight in action_loss_mask
+        )
 
     pi0_config = Pi0Config(**pi0_kwargs)
     rlt_cfg = build_rlt_config(model_cfg)

@@ -31,13 +31,19 @@ The norm-stats file is never modified: every mode copies the input
 JAX Pi0/Pi05 orbax checkpoint -> OpenPI_RLinf bare `Pi0` layout.
 
 - **Input**: a JAX checkpoint directory containing a `params/` subdir (orbax
-  pytree). The `--input-norm-stats` path points at the matching
+  pytree). Both plain parameter arrays and Flax NNX parameters saved as
+  `{"value": array}` are supported, including checkpoints with an outer `params`
+  collection. The converter removes the parameter wrappers while preserving
+  module names such as the attention `value` projection. The
+  `--input-norm-stats` path points at the matching
   `norm_stats.json`. Requires `jax` / `orbax` installed (imported lazily, only
   when this mode runs).
 - **Output**: `<output-model>/model.safetensors` + `<output-model>/config.json`;
   norm-stats copied to `--output-norm-stats`.
 - **Dtype policy**: weights are written in **fp32**, but the emitted
   `config.json` records a `"dtype": "bfloat16"` hint for the eval loader.
+  FP32 source parameters retain their values through the layout conversion;
+  removing NNX wrappers does not round them to BF16.
 - **Norm-stats**: input copied verbatim to the output path.
 
 ```bash

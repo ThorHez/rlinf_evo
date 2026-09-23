@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import ast
+import csv
 import ctypes
 import os
 import pickle
@@ -6274,6 +6275,60 @@ def test_camera_tool_reports_no_devices(monkeypatch):
         runpy.run_path(str(SCRIPT), run_name="__main__")
 
     assert events == []
+
+
+@pytest.fixture
+def camera_latency_tool():
+    pytest.importorskip("cv2")
+    from toolkits.realworld_check import measure_camera_latency
+
+    return measure_camera_latency
+
+
+def test_camera_latency_annotation_preserves_the_captured_image(camera_latency_tool):
+    frame = np.random.default_rng(0).integers(
+        0, 256, size=(120, 640, 3), dtype=np.uint8
+    )
+    original = frame.copy()
+
+    annotated = camera_latency_tool.annotate_frame(frame, received_ms=1234.5)
+    later = camera_latency_tool.annotate_frame(frame, received_ms=5678.9)
+
+    assert annotated.shape[0] == frame.shape[0] + 100
+    assert annotated.shape[1] >= frame.shape[1]
+    np.testing.assert_array_equal(annotated[100:, : frame.shape[1]], original)
+    np.testing.assert_array_equal(frame, original)
+    assert np.any(annotated[:100] != later[:100]), (
+        "The annotation must show the supplied reception timestamp."
+    )
+
+
+def test_camera_latency_samples_keep_receive_time_and_do_not_overwrite(
+    camera_latency_tool, tmp_path
+):
+    import cv2
+
+    received_ms = 1234.5
+    frames = [np.full((120, 640, 3), value, dtype=np.uint8) for value in (40, 200)]
+    paths = [
+        camera_latency_tool.save_sample(tmp_path, frame, received_ms)
+        for frame in frames
+    ]
+
+    assert paths[0] != paths[1], "Saving the same timestamp must retain both samples."
+    for path, frame in zip(paths, frames):
+        np.testing.assert_array_equal(
+            cv2.imread(str(path)),
+            camera_latency_tool.annotate_frame(frame, received_ms),
+        )
+
+    with (tmp_path / "samples.csv").open(newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    assert [row["image"] for row in rows] == [path.name for path in paths]
+    for row in rows:
+        assert float(row["received_ms"]) == received_ms
+        assert row["source_ms"] == ""
+        assert row["latency_ms"] == ""
 
 
 RNG = np.random.default_rng(0)

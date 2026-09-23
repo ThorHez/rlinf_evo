@@ -140,12 +140,24 @@ class Pi0Eval(EnvIO, Pi0):
             prefix_mask,
             kv_cache,
         )
-        ref_chunk = self.output_transform(
-            {"actions": model_actions, "state": observation.state}
-        )["actions"]
+        if self.config_name == "pi05_umi_v4":
+            from rlinf.algorithms.rlt.torch_action_codec import project_eef_actions
+
+            # Stage 2, human replay, and the environment codec share the model's
+            # normalized XYZ domain. The generic output transform unnormalizes
+            # it and is only suitable for direct Stage 1 deployment.
+            ref_chunk = project_eef_actions(model_actions[..., :10])
+            if self.action_chunk is not None:
+                ref_chunk = ref_chunk[:, : self.action_chunk]
+        else:
+            ref_chunk = self.output_transform(
+                {"actions": model_actions, "state": observation.state}
+            )["actions"]
 
         raw_proprio = self._select_configured_state(env_obs["states"])
-        if "maniskill" in self.config_name.lower():
+        if self.config_name == "pi05_umi_v4":
+            proprio = observation.state
+        elif "maniskill" in self.config_name.lower():
             state_dim = (
                 raw_proprio.shape[-1]
                 if hasattr(raw_proprio, "shape")

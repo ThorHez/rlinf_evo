@@ -17,6 +17,10 @@ from collections import OrderedDict
 import torch
 import torch.nn as nn
 
+from rlinf.algorithms.rlt.torch_action_codec import (
+    parameterize_eef_residual,
+    validate_eef_action_config,
+)
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
 from rlinf.models.embodiment.modules.utils import make_mlp
 
@@ -52,10 +56,12 @@ class DirectGaussianActor(nn.Module):
         num_hidden_layers: int = 2,
         sigma: float = 0.1,
         ref_dropout: float = 0.0,
+        clamp_actions: bool = True,
     ) -> None:
         super().__init__()
         self.sigma = float(sigma)
         self.ref_dropout = float(ref_dropout)
+        self.clamp_actions = clamp_actions
         self.mlp = _make_td3_mlp(
             input_dim=int(state_dim) + int(action_chunk_dim),
             output_dim=int(action_chunk_dim),
@@ -97,7 +103,7 @@ class DirectGaussianActor(nn.Module):
         action = self.mlp(torch.cat([x, reference], dim=-1))
         if apply_action_noise and self.sigma > 0.0:
             action = action + torch.randn_like(action) * self.sigma
-        return action.clamp(-1.0, 1.0)
+        return action.clamp(-1.0, 1.0) if self.clamp_actions else action
 
 
 class QNetwork(nn.Module):
@@ -155,7 +161,9 @@ class RLTTD3MLPPolicy(nn.Module, BasePolicy):
 
     The rollout feature path is unchanged: OpenPI still produces ``z_rl``,
     ``proprio`` and ``ref_chunk``. This module only swaps the lightweight
-    Stage2 head from the AC MLP to the direct TD3 MLP used in ablation.
+    Stage2 head from the AC MLP to the direct TD3 MLP used in ablation. The
+    opt-in ``eef_rot6d`` mode instead predicts a reference residual, with
+    exploration noise scaled separately for XYZ, rotation rows, and width.
     """
 
     def __init__(
@@ -171,6 +179,10 @@ class RLTTD3MLPPolicy(nn.Module, BasePolicy):
         mlp_num_hidden_layers: int = 2,
         actor_noise_sigma: float = 0.1,
         ref_action_dropout: float = 0.0,
+        action_parameterization: str = "clamp",
+        gripper_width_min: float = 0.0,
+        gripper_width_max: float | None = None,
+        eef_residual_scale: tuple[float, ...] | None = None,
     ) -> None:
         super().__init__()
         if not add_q_head:
@@ -201,6 +213,21 @@ class RLTTD3MLPPolicy(nn.Module, BasePolicy):
         self.flat_action_dim = self.chunk_len * self.step_action_dim
         self.state_dim = self.z_dim + self.proprio_dim
         self.torch_compile_enabled = False
+        self.action_parameterization = action_parameterization
+        if action_parameterization not in ("clamp", "eef_rot6d"):
+            raise ValueError(
+                f"Unknown action parameterization: {action_parameterization!r}."
+            )
+        if action_parameterization == "eef_rot6d":
+            scale = validate_eef_action_config(
+                self.step_action_dim,
+                gripper_width_min,
+                gripper_width_max,
+                eef_residual_scale,
+            )
+            self.gripper_width_min = float(gripper_width_min)
+            self.gripper_width_max = float(gripper_width_max)
+            self.register_buffer("eef_residual_scale", scale)
 
         self.actor = DirectGaussianActor(
             state_dim=self.state_dim,
@@ -209,7 +236,12 @@ class RLTTD3MLPPolicy(nn.Module, BasePolicy):
             num_hidden_layers=mlp_num_hidden_layers,
             sigma=actor_noise_sigma,
             ref_dropout=ref_action_dropout,
+            clamp_actions=action_parameterization == "clamp",
         )
+        if action_parameterization == "eef_rot6d":
+            # Begin with the Stage 1 action instead of an arbitrary EEF target.
+            nn.init.zeros_(self.actor.mlp.net[-1].weight)
+            nn.init.zeros_(self.actor.mlp.net[-1].bias)
         # Name this q_head so existing SAC/RLT optimizer filtering keeps actor
         # and critic optimizers separate.
         self.q_head = TwinQCritic(
@@ -297,6 +329,14 @@ class RLTTD3MLPPolicy(nn.Module, BasePolicy):
             apply_action_noise=apply_action_noise,
             ref_dropout=reference_dropout_prob,
         )
+        if self.action_parameterization == "eef_rot6d":
+            action = parameterize_eef_residual(
+                self._format_chunk_actions(action),
+                self._format_chunk_actions(self._get_ref_chunk(obs)),
+                self.eef_residual_scale,
+                self.gripper_width_min,
+                self.gripper_width_max,
+            ).reshape(action.shape)
         return action, torch.zeros_like(action), None
 
     def sac_q_forward(
@@ -357,6 +397,10 @@ class RLTTD3MLPPolicy(nn.Module, BasePolicy):
         chunk_actions = self._format_chunk_actions(action)
 
         forward_inputs = {"action": action, "model_action": action}
+        if self.action_parameterization == "eef_rot6d":
+            forward_inputs["preserve_rlt_reference"] = torch.ones(
+                action.shape[0], 1, dtype=torch.bool, device=action.device
+            )
         if return_obs:
             forward_inputs.update(obs)
 

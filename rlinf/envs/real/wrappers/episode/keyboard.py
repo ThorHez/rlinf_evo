@@ -15,7 +15,6 @@
 import errno
 import os
 import threading
-import time
 from collections import deque
 from typing import Any
 
@@ -46,6 +45,10 @@ class KeyboardListener:
         self.latest_data = {"key": None}
         # Queue press edges so short taps are not lost between polls.
         self._press_events: deque[str] = deque()
+        self._stop = threading.Event()
+        self._device_lock = threading.Lock()
+        self._closed = False
+        self._error: Exception | None = None
         self.device = self._open_keyboard_device()
 
         self.listener = threading.Thread(
@@ -152,9 +155,13 @@ class KeyboardListener:
     def _listen_loop(self) -> None:
         # Retain the path so the listener can recover after USB disconnects.
         device_path = self.device.path
-        while True:
+        # evdev opens input descriptors O_NONBLOCK. Bounded reads let close()
+        # terminate an idle listener without depending on a new key event.
+        while not self._stop.wait(0.01):
             try:
-                for event in self.device.read_loop():
+                for event in self.device.read():
+                    if self._stop.is_set():
+                        return
                     if event.type != self._ecodes.EV_KEY:
                         continue
 
@@ -174,7 +181,11 @@ class KeyboardListener:
                         with self.state_lock:
                             if self.latest_data["key"] == key:
                                 self.latest_data["key"] = None
+            except BlockingIOError:
+                continue
             except OSError as exc:
+                if self._stop.is_set():
+                    return
                 if exc.errno != errno.ENODEV:
                     _logger.error(
                         "Keyboard device %s read failed (errno=%s): %s",
@@ -182,7 +193,10 @@ class KeyboardListener:
                         exc.errno,
                         exc,
                     )
-                    raise
+                    with self.state_lock:
+                        self._error = exc
+                        self.latest_data["key"] = None
+                    return
                 _logger.warning(
                     "Keyboard device %s disconnected (errno=ENODEV); "
                     "reopening until it returns.",
@@ -195,14 +209,50 @@ class KeyboardListener:
                 except Exception:
                     pass
                 # Keep retrying until the device returns or the process exits.
-                while True:
-                    time.sleep(0.5)
+                while not self._stop.wait(0.5):
                     try:
-                        self.device = self._input_device_cls(device_path)
+                        with self._device_lock:
+                            if self._stop.is_set():
+                                return
+                            replacement = self._input_device_cls(device_path)
+                            if self._stop.is_set():
+                                replacement.close()
+                                return
+                            self.device = replacement
                         break
                     except (FileNotFoundError, OSError):
                         continue
+                else:
+                    return
                 _logger.info("Keyboard device %s reopened.", device_path)
+            except Exception as exc:
+                if not self._stop.is_set():
+                    with self.state_lock:
+                        self._error = exc
+                        self.latest_data["key"] = None
+                    _logger.error("Keyboard device %s failed: %s", device_path, exc)
+                return
+
+    @property
+    def error(self) -> Exception | None:
+        """Return an unrecoverable input error for the control loop to handle."""
+        with self.state_lock:
+            return self._error
+
+    def close(self) -> None:
+        """Stop polling and reconnecting, and release the input descriptor."""
+        self._stop.set()
+        with self._device_lock:
+            if not self._closed:
+                self.device.close()
+                self._closed = True
+        if self.listener is not threading.current_thread():
+            self.listener.join(timeout=1.0)
+            if self.listener.is_alive():
+                raise RuntimeError("Keyboard input thread did not stop")
+        with self.state_lock:
+            self.latest_data["key"] = None
+            self._press_events.clear()
 
     def _event_to_key(self, key_code: int) -> str | None:
         key_name = self._ecodes.bytype[self._ecodes.EV_KEY].get(key_code)

@@ -104,6 +104,10 @@ class RealWorldEnv(gym.Env):
         from rlinf.envs.real import load_tasks
 
         load_tasks()
+        # ARX uses its own local SDK service and must not stop unrelated ROS
+        # processes. Defer legacy ROS setup until an environment needs it.
+        if self.cfg.get("ros_setup", True):
+            self.realworld_setup()
         env = gym.make(
             id=self.cfg.init_params.id,
             override_cfg=override_cfg,
@@ -180,6 +184,11 @@ class RealWorldEnv(gym.Env):
     @property
     def action_space(self) -> gym.Space:
         return self.env.action_space
+
+    def close(self) -> None:
+        """Close the vector environment and release its robot resources."""
+        if getattr(self, "env", None) is not None:
+            self.env.close()
 
     @property
     def observation_space(self) -> gym.Space:
@@ -289,6 +298,10 @@ class RealWorldEnv(gym.Env):
                 f"main_image_key {self.main_image_key!r} not in {list(frames)}"
             )
         obs["main_images"] = frames[self.main_image_key]
+        for key in getattr(self, "cfg", {}).get("model_obs_keys", []):
+            if key in obs or key in {"task_descriptions", "extra_view_images"}:
+                raise ValueError(f"Model observation key shadows a runner field: {key}")
+            obs[key] = raw_obs["model_obs"][key]
         raw_images = OrderedDict(sorted(frames.items()))
         raw_images.pop(self.main_image_key)
 
@@ -375,9 +388,15 @@ class RealWorldEnv(gym.Env):
             infos,
         )
 
-    def _notify_action_chunk_begin(self) -> None:
+    def _notify_action_chunk_begin(self, chunk_size: int) -> None:
         """Tell intervention wrappers a new action chunk is starting."""
         for env in self.env.envs:
+            try:
+                configure = env.get_wrapper_attr("set_action_chunk_size")
+            except AttributeError:
+                configure = None
+            if configure is not None:
+                configure(chunk_size)
             try:
                 on_begin = env.get_wrapper_attr("on_action_chunk_begin")
             except AttributeError:
@@ -399,7 +418,9 @@ class RealWorldEnv(gym.Env):
         raw_chunk_intervene_actions = []
         raw_chunk_intervene_flag = []
         raw_chunk_rlt_switch_flags = []
-        self._notify_action_chunk_begin()
+        raw_chunk_valid = []
+        raw_chunk_executed = []
+        self._notify_action_chunk_begin(chunk_size)
         for i in range(chunk_size):
             actions = chunk_actions[:, i]
             extracted_obs, step_reward, terminations, truncations, infos = self.step(
@@ -412,6 +433,15 @@ class RealWorldEnv(gym.Env):
                 raw_chunk_intervene_flag.append(infos["intervene_flag"])
             if "rlt_switch_flags" in infos:
                 raw_chunk_rlt_switch_flags.append(infos["rlt_switch_flags"])
+            if "transition_valid" in infos:
+                raw_chunk_valid.append(
+                    torch.as_tensor(infos["transition_valid"], dtype=torch.bool)
+                )
+            if "executed_action" in infos:
+                # Gymnasium 0.29 stores array-valued infos in an object array;
+                # 1.x may already stack them. Normalize both at this boundary.
+                executed = np.stack(list(infos["executed_action"])).astype(np.float32)
+                raw_chunk_executed.append(torch.from_numpy(executed))
 
             chunk_rewards.append(step_reward)
             raw_chunk_terminations.append(terminations)
@@ -441,6 +471,22 @@ class RealWorldEnv(gym.Env):
                 raw_chunk_rlt_switch_flags, dim=1
             )
             infos_list[-1] = infos_last
+        if raw_chunk_valid:
+            if len(raw_chunk_valid) != chunk_size:
+                raise ValueError(
+                    "Transition validity must be reported for every chunk step."
+                )
+            infos_last["transition_valid"] = torch.stack(raw_chunk_valid, dim=1).all(
+                dim=1, keepdim=True
+            )
+        if raw_chunk_executed:
+            if len(raw_chunk_executed) != chunk_size:
+                raise ValueError(
+                    "Executed actions must be reported for every chunk step."
+                )
+            infos_last["executed_actions"] = torch.stack(
+                raw_chunk_executed, dim=1
+            ).reshape(self.num_envs, -1)
 
         if past_dones.any() and self.auto_reset:
             obs_list[-1], infos_list[-1] = self._handle_auto_reset(

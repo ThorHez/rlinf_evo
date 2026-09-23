@@ -31,27 +31,6 @@ class RLTTD3LossMixin(RLTACLossMixin):
             obs=next_obs,
         )
 
-    def _human_mask(
-        self,
-        intervene_flags: torch.Tensor | None,
-        *,
-        batch_size: int,
-        chunk_len: int,
-        action_dim: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        if intervene_flags is None:
-            return torch.zeros(
-                (batch_size, chunk_len),
-                dtype=torch.bool,
-                device=device,
-            )
-
-        flags = self._flatten_chunk(intervene_flags).to(device=device).bool()
-        if flags.shape[-1] == chunk_len:
-            return flags.reshape(batch_size, chunk_len)
-        return flags.reshape(batch_size, chunk_len, action_dim).any(dim=-1)
-
     def _td3_bc_metrics(
         self,
         pi: torch.Tensor,
@@ -59,41 +38,8 @@ class RLTTD3LossMixin(RLTACLossMixin):
         ref_chunk: torch.Tensor,
         intervene_flags: torch.Tensor | None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        chunk_len, action_dim = self._chunk_shape()
-        pi_chunk = self._flatten_chunk(pi).reshape(-1, chunk_len, action_dim)
-        action_chunk = self._flatten_chunk(actions).reshape(-1, chunk_len, action_dim)
-        ref_chunk = self._flatten_chunk(ref_chunk).reshape(-1, chunk_len, action_dim)
-
-        human_mask = self._human_mask(
-            intervene_flags,
-            batch_size=pi_chunk.shape[0],
-            chunk_len=chunk_len,
-            action_dim=action_dim,
-            device=pi_chunk.device,
-        )
-        bc_target = torch.where(human_mask[..., None], action_chunk, ref_chunk)
-        bc_error = torch.mean(torch.square(pi_chunk - bc_target), dim=-1)
-        bc_loss = torch.mean(bc_error)
-
-        policy_mask = ~human_mask
-        ref_error = torch.mean(torch.square(pi_chunk - ref_chunk), dim=-1)
-        human_error = torch.mean(torch.square(pi_chunk - action_chunk), dim=-1)
-        bc_ref = torch.sum(ref_error * policy_mask.to(ref_error.dtype)) / torch.clamp(
-            torch.sum(policy_mask.to(ref_error.dtype)), min=1.0
-        )
-        bc_human = torch.sum(
-            human_error * human_mask.to(human_error.dtype)
-        ) / torch.clamp(torch.sum(human_mask.to(human_error.dtype)), min=1.0)
-
-        human_ratio = torch.mean(human_mask.to(torch.float32)).item()
-        metrics = {
-            "bc_loss": bc_loss.detach().item(),
-            "bc_ref_loss": bc_ref.detach().item(),
-            "bc_human_loss": bc_human.detach().item(),
-            "human_mask_ratio": human_ratio,
-            "policy_mask_ratio": 1.0 - human_ratio,
-        }
-        return bc_loss, metrics
+        """Use the shared human-action/reference BC targets for RLT replay."""
+        return self._bc_metrics(pi, actions, ref_chunk, intervene_flags)
 
     def _td3_actor_q(self, all_q_values: torch.Tensor) -> torch.Tensor:
         actor_agg_q = self.cfg.algorithm.get("actor_agg_q", "min")

@@ -19,6 +19,7 @@ from __future__ import annotations
 import dataclasses
 import importlib
 import importlib.util
+import inspect
 import io
 import os
 import pickle
@@ -1320,6 +1321,116 @@ def test_streaming_device_lifecycle_without_hardware():
 
 
 # Keyboard sessions
+
+
+@pytest.fixture
+def evdev_input(monkeypatch):
+    from collections import deque
+    from types import SimpleNamespace
+
+    from robot_mocks.teleop import keyboard
+
+    module = keyboard()
+    source = SimpleNamespace(events=deque(), error=None, opens=0, devices=[])
+    original = module.InputDevice
+
+    class Device(original):
+        def __init__(self, path):
+            super().__init__(path)
+            source.opens += 1
+            source.devices.append(self)
+
+        def read(self):
+            if source.error is not None:
+                raise source.error
+            if not source.events:
+                raise BlockingIOError()
+            events = list(source.events)
+            source.events.clear()
+            return events
+
+    module.InputDevice = Device
+    monkeypatch.setitem(sys.modules, "evdev", module)
+    monkeypatch.delenv("RLINF_KEYBOARD_DEVICE", raising=False)
+    return module, source
+
+
+def test_keyboard_listener_preserves_press_edges_and_closes_idle_device(evdev_input):
+    from types import SimpleNamespace
+
+    from rlinf.envs.real.wrappers.episode.keyboard import KeyboardListener
+
+    module, source = evdev_input
+    listener = KeyboardListener()
+    try:
+        for value in (1, 2, 0):
+            source.events.append(
+                SimpleNamespace(
+                    type=module.ecodes.EV_KEY, code=module.ecodes.KEY_B, value=value
+                )
+            )
+        deadline = time.monotonic() + 1
+        presses = []
+        while time.monotonic() < deadline and not presses:
+            presses = listener.pop_pressed_keys()
+            time.sleep(0.01)
+        assert presses == ["b"]
+        assert listener.get_key() is None
+        assert listener.error is None
+    finally:
+        start = time.monotonic()
+        listener.close()
+        listener.close()
+        assert time.monotonic() - start < 0.5
+    assert all(device.closed for device in source.devices)
+    assert not listener.listener.is_alive()
+
+
+def test_keyboard_close_interrupts_reconnect_without_reopening(evdev_input):
+    import errno
+
+    from rlinf.envs.real.wrappers.episode.keyboard import KeyboardListener
+
+    _, source = evdev_input
+    listener = KeyboardListener()
+    source.error = OSError(errno.ENODEV, "unplugged")
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline and not source.devices[0].closed:
+        time.sleep(0.01)
+    assert source.devices[0].closed
+    listener.close()
+    opens = source.opens
+    time.sleep(0.55)
+    assert source.opens == opens
+    assert not listener.listener.is_alive()
+
+
+def test_keyboard_fatal_read_error_is_observable_and_session_closes(evdev_input):
+    import errno
+
+    from rlinf.envs.real.wrappers.episode.session import KeyboardSession
+
+    _, source = evdev_input
+
+    class Env(gym.Env):
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    session = KeyboardSession(Env())
+    try:
+        source.error = OSError(errno.EIO, "read failure")
+        deadline = time.monotonic() + 1
+        while session.listener.error is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert isinstance(session.listener.error, OSError)
+        assert session.listener.error.errno == errno.EIO
+        assert session.listener.get_key() is None
+    finally:
+        session.close()
+    assert session.env.closed
+    assert all(device.closed for device in source.devices)
 
 
 def _keyboard_session(monkeypatch, queued):
@@ -4427,3 +4538,640 @@ def test_robotwin_eval_success_seed_order_is_controlled_by_base_seed():
 
     assert selected_seed_0 == selected_seed_0_again
     assert selected_seed_0 != selected_seed_1
+
+
+@pytest.fixture
+def arx_env(tmp_path, monkeypatch):
+    """Real env, SDK adapter and control service; fake only CAN/IK and camera."""
+    import json
+
+    from robot_mocks.arx5 import (
+        FakeArxController,
+        FakeArxSDK,
+        FakeArxSolver,
+        InProcessArxClient,
+        TimedCamera,
+    )
+
+    from rlinf.envs.real.arx5 import Arx5RLTEnv
+    from rlinf.robotics.parts.arms import arx5
+    from rlinf.robotics.parts.arms.arx5_protocol import (
+        Arx5Service,
+        MotionLimits,
+        SdkArx5Adapter,
+    )
+
+    stats = {
+        name: {"min": [-1.0] * dim, "max": [1.0] * dim}
+        for name, dim in [("state", 16), ("actions", 10)]
+    }
+    path = tmp_path / "norm_stats.json"
+    path.write_text(json.dumps({"norm_stats": stats}))
+    controller, solver = FakeArxController(), FakeArxSolver()
+    service = Arx5Service(
+        SdkArx5Adapter(FakeArxSDK, controller, solver),
+        allow_motion=True,
+        limits=MotionLimits(translation=0.05, rotation=0.2, gripper=0.05, joint=0.3),
+        sample_hz=300,
+        history_seconds=3,
+        command_timeout=3,
+    )
+    service.start()
+    monkeypatch.setattr(arx5, "Arx5Client", lambda *_: InProcessArxClient(service))
+    arm = arx5.Arx5Arm()
+    arm.connect()
+    camera = TimedCamera()
+    env = Arx5RLTEnv(
+        {
+            "norm_stats_path": str(path),
+            "action_dt": 0.02,
+            "history_dt": 0.01,
+            "camera_latency": 0.0,
+            "enable_keyboard": False,
+            "start_paused": False,
+            "gripper_width_min": 0.01,
+            "gripper_width_max": 0.08,
+            "camera_fps": 200,
+            "max_state_gap": 0.1,
+            "observation_timeout": 0.15,
+            "max_frame_age": 0.1,
+            "record_dir": str(tmp_path / "records"),
+        },
+        arm=arm,
+        camera=camera,
+    )
+    try:
+        yield SimpleNamespace(
+            env=env,
+            arm=arm,
+            camera=camera,
+            controller=controller,
+            solver=solver,
+            service=service,
+            path=tmp_path,
+        )
+    finally:
+        env.close()
+        arm.disconnect()
+        service.stop()
+
+
+def test_arx_env_observation_and_chunk_use_exact_original_anchor(arx_env):
+    env, arm = arx_env.env, arx_env.arm
+    obs, info = env.reset()
+    assert env.observation_space.contains(obs)
+    np.testing.assert_allclose(obs["model_obs"]["robot0_eef_pos"], 0, atol=1e-6)
+    np.testing.assert_array_equal(obs["frames"]["wrist_1"][0, 0], [33, 22, 11])
+    anchor = arm.get_state().tcp_pose.copy()
+    first, second = anchor.copy(), anchor.copy()
+    first[0] += 0.01
+    second[0] += 0.02
+    actions = env.codec.encode_action(np.stack([first, second]), [0.04, 0.04], anchor)
+    env.on_action_chunk_begin()
+    for action, target in zip(actions, [first, second]):
+        _, reward, done, trunc, info = env.step(action)
+        assert reward == 0 and not done and not trunc and info["transition_valid"]
+        np.testing.assert_allclose(arm.get_state().tcp_pose, target, atol=1e-6)
+    # If each step rebases on the latest pose, this incorrectly ends at +.03.
+    assert arm.get_state().tcp_pose[0] == pytest.approx(anchor[0] + 0.02)
+    env.close()
+    assert arm.get_state().mode == "hold"
+
+
+@pytest.mark.parametrize("model_type", ["rlt_mlp_policy", "rlt_td3_mlp_policy"])
+def test_arx_env_executes_both_rlt_policies_with_the_same_eef_contract(
+    arx_env, model_type
+):
+    from scipy.spatial.transform import Rotation
+
+    from rlinf.models.embodiment.mlp_policy import get_model
+
+    policy = get_model(
+        OmegaConf.create(
+            {
+                "model_type": model_type,
+                "z_dim": 4,
+                "proprio_dim": 32,
+                "action_dim": 10,
+                "num_action_chunks": 2,
+                "action_parameterization": "eef_rot6d",
+                "gripper_width_min": 0.01,
+                "gripper_width_max": 0.08,
+                "mlp_hidden_dim": 16,
+                "mlp_num_hidden_layers": 1,
+            }
+        ),
+        torch_dtype=torch.float32,
+    ).eval()
+    env, arm = arx_env.env, arx_env.arm
+    observation, _ = env.reset()
+    anchor = arm.get_state().tcp_pose.copy()
+    targets = np.tile(anchor, (2, 1))
+    targets[:, 0] += [0.01, 0.02]
+    targets[:, 3:] = (
+        Rotation.from_quat(anchor[3:])
+        * Rotation.from_rotvec([[0.02, -0.01, 0.01], [0.04, -0.02, 0.02]])
+    ).as_quat()
+    widths = np.array([0.045, 0.05])
+    reference = env.codec.encode_action(targets, widths, anchor)
+    features = {
+        "z_rl": torch.zeros(1, 4),
+        "proprio": torch.from_numpy(
+            env.codec.flatten_observation(observation["model_obs"], normalize=True)
+        )[None],
+        "ref_chunk": torch.tensor(reference[None], dtype=torch.float32),
+    }
+    actions, result = policy.predict_action_batch(features, mode="eval")
+    assert result["forward_inputs"]["preserve_rlt_reference"].all()
+    np.testing.assert_allclose(actions[0], reference, atol=1e-6)
+    env.on_action_chunk_begin()
+    for action, target, width in zip(actions[0].numpy(), targets, widths):
+        _, reward, done, truncated, info = env.step(action)
+        assert info["transition_valid"] and not done and not truncated
+        assert reward == 0
+        state = arm.get_state()
+        np.testing.assert_allclose(state.tcp_pose, target, atol=1e-6)
+        assert state.gripper_width == pytest.approx(width, abs=1e-6)
+        np.testing.assert_allclose(info["executed_action"], action, atol=1e-6)
+
+
+def test_arx_env_takeover_during_inference_cancels_stale_chunk(arx_env):
+    env, arm = arx_env.env, arx_env.arm
+    env.reset()
+    anchor = arm.get_state().tcp_pose.copy()
+    target = anchor.copy()
+    target[0] += 0.02
+    action = env.codec.encode_action(target, 0.04, anchor)
+    env.handle_operator_event("drag")
+    before = arx_env.controller.command_count
+    env.on_action_chunk_begin()
+    _, _, _, _, info = env.step(action)
+    assert not info["transition_valid"]
+    assert arx_env.controller.command_count == before
+    env.handle_operator_event("resume")
+    resumed = arx_env.controller.command_count
+    _, _, _, _, info = env.step(action)
+    assert not info["transition_valid"]
+    assert arx_env.controller.command_count == resumed
+    # A fresh observation and new chunk can re-enable policy execution.
+    env.on_action_chunk_begin()
+    anchor = arm.get_state().tcp_pose
+    _, _, _, _, info = env.step(env.codec.encode_action(anchor, 0.04, anchor))
+    assert info["transition_valid"]
+
+
+def test_arx_env_drag_records_measured_future_targets_and_refreshes_observation(
+    arx_env,
+):
+    env, arm = arx_env.env, arx_env.arm
+    env.reset()
+    env.handle_operator_event("drag")
+    # Consume the cancelled pre-takeover result; its next observation is fresh.
+    action = env.codec.encode_action(
+        arm.get_state().tcp_pose, 0.04, arm.get_state().tcp_pose
+    )
+    env.on_action_chunk_begin()
+    env.step(action)
+    time.sleep(0.025)
+    env.step(action)
+    env.on_action_chunk_begin()
+    anchor = arm.get_state().tcp_pose.copy()
+    before = arx_env.controller.command_count
+    arx_env.controller.state.pos()[0] += 0.015
+    time.sleep(0.04)  # Simulate inference taking longer than one action interval.
+    _, _, _, _, first = env.step(action)
+    _, _, _, _, second = env.step(action)
+    assert first["transition_valid"] and second["transition_valid"]
+    assert "intervene_action" in second
+    pose, _ = env.codec.decode_action(second["intervene_action"], anchor)
+    assert pose[0] == pytest.approx(anchor[0] + 0.015, abs=0.003)
+    assert arx_env.controller.command_count == before
+    # The next chunk anchors near the latest motion, not the delayed first image.
+    env.on_action_chunk_begin()
+    _, _, _, _, next_info = env.step(action)
+    assert next_info["transition_valid"]
+    np.testing.assert_allclose(next_info["intervene_action"][:3], 0, atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "event,reward", [("success", 1), ("failure", -1), ("abort", 0)]
+)
+def test_arx_env_operator_terminal_records_real_hold_and_rewards_once(
+    arx_env, event, reward
+):
+    env, arm = arx_env.env, arx_env.arm
+    env.reset()
+    anchor = arm.get_state().tcp_pose.copy()
+    action = env.codec.encode_action(anchor, 0.04, anchor)
+    env.handle_operator_event(event)
+    count = arx_env.controller.command_count
+    env.on_action_chunk_begin()
+    _, got_reward, done, _, info = env.step(action + 100)
+    assert (
+        got_reward == reward and done and info["transition_valid"] == (event != "abort")
+    )
+    np.testing.assert_allclose(info["executed_action"], action, atol=1e-6)
+    _, repeated, done, _, info = env.step(action + 100)
+    assert repeated == 0 and done and not info["transition_valid"]
+    assert arx_env.controller.command_count == count
+    assert arm.get_state().mode == "hold"
+    with pytest.raises(RuntimeError, match="Reset the episode"):
+        env.handle_operator_event("resume")
+
+
+def test_arx_env_camera_loss_holds_without_waiting_for_inference(arx_env):
+    env, arm = arx_env.env, arx_env.arm
+    env.reset()
+    arx_env.camera.fail = True
+    deadline = time.monotonic() + 1
+    while arm.get_state().mode == "policy" and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert arm.get_state().mode == "hold"
+    with pytest.raises(RuntimeError, match="loop failed"):
+        env.step(np.zeros(10))
+
+
+def test_arx_env_invalid_model_rotation_never_reaches_arm(arx_env):
+    env, arm = arx_env.env, arx_env.arm
+    env.reset()
+    # Degenerate rotation cannot be silently treated as a valid target.
+    with pytest.raises(ValueError, match="rot6d"):
+        env.step(np.zeros(10))
+    assert arm.get_state().mode == "hold"
+
+
+def test_arx_alignment_interpolates_shortest_rotation_and_refuses_data_gaps():
+    from scipy.spatial.transform import Rotation
+
+    from rlinf.envs.real.arx5.history import interpolate_states
+
+    states = [
+        SimpleNamespace(
+            timestamp=t,
+            tcp_pose=np.r_[
+                t, 0, 0, Rotation.from_euler("z", angle, degrees=True).as_quat()
+            ],
+            gripper_width=0.02 + t * 0.02,
+            server_id="one",
+        )
+        for t, angle in [(0.0, 170), (1.0, -170)]
+    ]
+    pose, grip = interpolate_states(states, [0.5], max_gap=1)
+    np.testing.assert_allclose(pose[0, :3], [0.5, 0, 0])
+    assert abs(
+        Rotation.from_quat(pose[0, 3:]).as_euler("xyz", degrees=True)[2]
+    ) == pytest.approx(180)
+    assert grip[0] == pytest.approx(0.03)
+    for times, gap in [
+        ([-0.01], 1),
+        ([1.01], 1),
+        ([0.5], 0.9),
+        ([], 1),
+        ([float("nan")], 1),
+    ]:
+        with pytest.raises(ValueError):
+            interpolate_states(states, times, max_gap=gap)
+    states[1].server_id = "two"
+    with pytest.raises(ValueError, match="restart"):
+        interpolate_states(states, [0.5], max_gap=1)
+    # Individually valid brackets on opposite sides of a restart must also fail.
+    more = [
+        SimpleNamespace(**{**vars(s), "timestamp": s.timestamp + 2}) for s in states
+    ]
+    states[1].server_id = "one"
+    more[0].server_id = more[1].server_id = "two"
+    with pytest.raises(ValueError, match="restart"):
+        interpolate_states(states + more, [0.5, 2.5], max_gap=1)
+
+
+@pytest.mark.parametrize(
+    "crop", [[-1, 0, 1, 1], [0, 0, 30, 2], [0, 0, 0, 1], [0, 0, 1.5, 2]]
+)
+def test_arx_image_rejects_invalid_checkpoint_crop(crop):
+    from rlinf.envs.real.arx5.history import prepare_rgb
+
+    with pytest.raises(ValueError):
+        prepare_rgb(np.zeros((10, 20, 3), dtype=np.uint8), crop)
+
+
+@pytest.mark.parametrize("during_drag", [False, True])
+def test_arx_controlled_terminal_completes_real_hold_tail_before_done(
+    arx_env, during_drag
+):
+    env, arm = arx_env.env, arx_env.arm
+    env.reset()
+    anchor = arm.get_state().tcp_pose.copy()
+    action = env.codec.encode_action(anchor, 0.04, anchor)
+    env.set_action_chunk_size(4)
+    if during_drag:
+        env.handle_operator_event("drag")
+        env.on_action_chunk_begin()
+        env.step(action)  # discard the pre-takeover observation
+        time.sleep(0.025)
+        env.step(action)
+    env.on_action_chunk_begin()
+    _, _, done, _, first = env.step(action)
+    assert not done and first["transition_valid"]
+    env.handle_operator_event("success")
+    requested = action.copy()
+    requested[:3] += 100  # these abandoned targets must never enter replay
+    start = time.monotonic()
+    tail = [env.step(requested) for _ in range(3)]
+    assert time.monotonic() - start >= 3 * env.config.action_dt
+    assert [t[1] for t in tail] == [0, 0, 1]
+    assert [t[2] for t in tail] == [False, False, True]
+    assert all(t[4]["transition_valid"] for t in tail)
+    assert arm.get_state().mode == "hold"
+    for transition in tail:
+        np.testing.assert_allclose(transition[4]["executed_action"], action, atol=1e-6)
+        assert ("intervene_action" in transition[4]) == during_drag
+
+
+def test_arx_terminal_during_policy_step_is_not_lost(arx_env):
+    env, arm = arx_env.env, arx_env.arm
+    env.reset()
+    anchor = arm.get_state().tcp_pose
+    action = env.codec.encode_action(anchor, 0.04, anchor)
+    env.set_action_chunk_size(2)
+    env.on_action_chunk_begin()
+    operator = threading.Timer(
+        env.config.action_dt / 2, lambda: env.handle_operator_event("success")
+    )
+    operator.start()
+    first = env.step(action)
+    operator.join(1)
+    last = env.step(action)
+    assert first[4]["transition_valid"] and last[4]["transition_valid"]
+    assert first[1:3] == (0, False)
+    assert last[1:3] == (1, True)
+
+
+def test_arx_stale_camera_frame_cannot_execute_policy(arx_env):
+    env, arm = arx_env.env, arx_env.arm
+    env.reset()
+    arx_env.camera.offset = -1
+    time.sleep(0.02)
+    anchor = arm.get_state().tcp_pose
+    with pytest.raises(RuntimeError, match="loop failed"):
+        env.step(env.codec.encode_action(anchor, 0.04, anchor))
+    assert arm.get_state().mode == "hold"
+
+
+def test_arx_takeover_followed_by_success_does_not_validate_stale_model_action(arx_env):
+    env, arm = arx_env.env, arx_env.arm
+    env.reset()
+    anchor = arm.get_state().tcp_pose
+    action = env.codec.encode_action(anchor, 0.04, anchor)
+    env.on_action_chunk_begin()
+
+    def intervene_then_label():
+        env.handle_operator_event("drag")
+        env.handle_operator_event("success")
+
+    operator = threading.Timer(env.config.action_dt / 2, intervene_then_label)
+    operator.start()
+    transition = env.step(action)
+    operator.join(1)
+    assert not transition[4]["transition_valid"]
+
+
+def test_arx_gripper_limit_records_the_actual_command(arx_env):
+    env, arm = arx_env.env, arx_env.arm
+    env.reset()
+    anchor = arm.get_state().tcp_pose
+    action = env.codec.encode_action(anchor, -1.0, anchor)
+    transition = env.step(action)
+    assert transition[4]["transition_valid"]
+    assert transition[4]["executed_action"][-1] == pytest.approx(0.01)
+    assert arm.get_state().gripper_width == pytest.approx(0.01)
+
+
+@pytest.mark.parametrize("shape", [(301, 407), (73, 45), (345, 223)])
+def test_arx_camera_transform_matches_resize_then_crop_oracle(shape):
+    import math
+
+    import cv2
+
+    from rlinf.envs.real.arx5.history import prepare_rgb
+
+    # Independent specification from the original deployment get_image_transform:
+    # fit the shorter side using ceil, AREA on reduction, then center-crop.
+    height, width = shape
+    y, x = np.indices(shape)
+    bgr = np.stack([(x * 17) % 256, (y * 3) % 256, (x + 2 * y) % 256], axis=-1).astype(
+        np.uint8
+    )
+    scale = 224 / min(height, width)
+    rw, rh = math.ceil(scale * width), math.ceil(scale * height)
+    expected = cv2.resize(
+        bgr, (rw, rh), interpolation=cv2.INTER_AREA if scale <= 1 else cv2.INTER_LINEAR
+    )
+    expected = expected[
+        (rh - 224) // 2 : (rh - 224) // 2 + 224,
+        (rw - 224) // 2 : (rw - 224) // 2 + 224,
+        ::-1,
+    ]
+    np.testing.assert_array_equal(prepare_rgb(bgr), expected)
+
+
+def test_arx_waiting_for_episode_start_can_be_aborted(arx_env):
+    env = arx_env.env
+    env.config.start_paused = True
+    failures = []
+
+    def wait_for_start():
+        try:
+            env.reset()
+        except Exception as exc:
+            failures.append(exc)
+
+    thread = threading.Thread(target=wait_for_start)
+    thread.start()
+    time.sleep(0.03)
+    env.handle_operator_event("success")  # Labels before start do not poison input.
+    env.handle_operator_event("abort")
+    thread.join(1)
+    assert not thread.is_alive()
+    assert len(failures) == 1 and isinstance(failures[0], InterruptedError)
+
+
+def test_arx_close_waits_for_operator_and_finishes_in_hold(arx_env, monkeypatch):
+    from robot_mocks.arx5 import InProcessArxClient
+
+    env, arm = arx_env.env, arx_env.arm
+    env.reset()
+    env.handle_operator_event("drag")
+    original = InProcessArxClient.request
+    reached, release = threading.Event(), threading.Event()
+
+    def blocked_resume(client, operation, **payload):
+        result = original(client, operation, **payload)
+        if operation == "resume_hold" and not reached.is_set():
+            reached.set()
+            assert release.wait(1)
+        return result
+
+    monkeypatch.setattr(InProcessArxClient, "request", blocked_resume)
+    operator = threading.Thread(target=lambda: env.handle_operator_event("resume"))
+    operator.start()
+    assert reached.wait(1)
+    closer = threading.Thread(target=env.close)
+    closer.start()
+    release.set()
+    operator.join(1)
+    closer.join(1)
+    assert not operator.is_alive() and not closer.is_alive()
+    assert arm.get_state().mode == "hold"
+
+
+@pytest.mark.parametrize("auto_reset", [False, True])
+@pytest.mark.parametrize("model_type", ["rlt_mlp_policy", "rlt_td3_mlp_policy"])
+def test_arx_realworld_chunk_retains_model_fields_actual_actions_and_terminal(
+    arx_env, monkeypatch, auto_reset, model_type
+):
+    from rlinf.envs.real.env import RealWorldEnv
+
+    env = arx_env.env
+    # The actual vector/chunk wrapper is exercised; only Gym's device factory
+    # hands back the already constructed fake-SDK environment.
+    monkeypatch.setattr(gym, "make", lambda **_: env)
+    monkeypatch.setattr(
+        RealWorldEnv, "realworld_setup", lambda: pytest.fail("ARX must not stop ROS")
+    )
+    cfg = OmegaConf.create(
+        {
+            "ros_setup": False,
+            "override_cfg": {},
+            "video_cfg": {"save_video": False},
+            "seed": 1,
+            "use_fixed_reset_state_ids": False,
+            "auto_reset": auto_reset,
+            "ignore_terminations": False,
+            "group_size": 1,
+            "main_image_key": "wrist_1",
+            "max_episode_steps": 320,
+            "init_params": {"id": "Arx5RLTEnv-v1"},
+            "model_obs_keys": [
+                "robot0_eef_pos",
+                "robot0_eef_rot_axis_angle",
+                "robot0_eef_rot_axis_angle_wrt_start",
+                "robot0_gripper_width",
+                "left_wrist_0_rgb_1",
+            ],
+        }
+    )
+    wrapper = RealWorldEnv(cfg, 1, 0, 1, None)
+    obs, _ = wrapper.reset()
+    assert obs["states"].shape == (1, 32)
+    assert obs["robot0_eef_pos"].shape == (1, 2, 3)
+    anchor = arx_env.arm.get_state().tcp_pose
+    action = env.codec.encode_action(anchor, 0.04, anchor)
+    env.handle_operator_event("success")
+    obs_list, rewards, done, truncated, infos = wrapper.chunk_step(
+        np.broadcast_to(action + 100, (1, 4, 10)).copy()
+    )
+    assert rewards.tolist() == [[0, 0, 0, 1]]
+    assert done.tolist() == [[False, False, False, True]]
+    assert not truncated.any()
+    finished = infos[-1].get("final_info", infos[-1])
+    assert finished["transition_valid"].tolist() == [[True]]
+    np.testing.assert_allclose(
+        finished["executed_actions"].reshape(4, 10), np.tile(action, (4, 1)), atol=1e-6
+    )
+    assert obs_list[-1]["left_wrist_0_rgb_1"].shape == (1, 224, 224, 3)
+    assert finished["episode"]["return"].tolist() == [1]
+
+    # Exercise the environment worker's real post-reset serialization boundary.
+    from rlinf.workers.env.env_worker import EnvWorker
+
+    wrapper.reset()
+    env.handle_operator_event("actor")
+    env.handle_operator_event("success")
+    cfg.env_type = "real"
+    worker = object.__new__(EnvWorker)
+    worker.cfg = OmegaConf.create({"env": {"train": cfg}})
+    worker.model_cfg = OmegaConf.create(
+        {"model_type": model_type, "num_action_chunks": 4, "action_dim": 10}
+    )
+    worker.env_list = [wrapper]
+    worker.use_external_reward_model = False
+    output, metrics, _ = inspect.unwrap(EnvWorker.env_interact_step)(
+        worker, torch.tensor(np.broadcast_to(action + 100, (1, 4, 10)).copy()), 0
+    )
+    assert output.transition.transition_valid.tolist() == [[True]]
+    np.testing.assert_allclose(
+        output.transition.executed_actions.reshape(4, 10),
+        np.tile(action, (4, 1)),
+        atol=1e-6,
+    )
+    assert output.rewards.tolist() == [[0, 0, 0, 1]]
+    assert metrics["return"].tolist() == [1]
+    assert output.rlt_switch_flags.all().item() == (not auto_reset)
+    assert (output.final_obs is not None) == auto_reset
+    wrapper.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        env.step(action)
+
+
+def test_arx_env_worker_preserves_rlt_mode_across_bootstrap():
+    from rlinf.data.schema.embodied_types import EnvOutput, EnvTransition
+    from rlinf.workers.env.env_worker import EnvWorker
+
+    worker = object.__new__(EnvWorker)
+    worker.cfg = OmegaConf.create({"env": {"train": {"auto_reset": True}}})
+    worker.stage_num = worker.train_num_envs_per_stage = 1
+    worker.model_cfg = OmegaConf.create({"num_action_chunks": 16})
+    output = EnvOutput(
+        obs={"states": torch.ones(1, 32)},
+        transition=EnvTransition(rlt_switch_flags=torch.ones(1, 16, dtype=torch.bool)),
+    )
+    worker.store_last_obs_and_intervened_info([output])
+    result = inspect.unwrap(EnvWorker.bootstrap_step)(worker)
+    assert result[0].rlt_switch_flags.all()
+    assert result[0].dones.shape == (1, 16)
+    assert not result[0].dones.any()
+
+
+def test_arx_eval_first_request_uses_actor_mode_from_reset():
+    from rlinf.workers.env.env_worker import EnvWorker
+
+    worker = object.__new__(EnvWorker)
+    worker.cfg = OmegaConf.create(
+        {"env": {"eval": {"auto_reset": False}}, "rollout": {"group_name": "rollout"}}
+    )
+    worker.stage_num = worker.eval_rollout_epoch = worker.eval_num_envs_per_stage = 1
+    worker.eval_prev_done = [None]
+    worker.n_eval_chunk_steps = 0
+    worker.eval_enable_offload = False
+    worker.env_decoupled_mode = False
+    worker.enable_rlt = True
+    worker.eval_env_list = [
+        SimpleNamespace(
+            reset=lambda: (
+                {"states": torch.ones(1, 32)},
+                {"rlt_switch_flags": np.array([True])},
+            )
+        )
+    ]
+    requests = []
+    worker.send_to = lambda **kwargs: requests.append(kwargs["data"])
+    worker.finish_rollout = lambda **_: None
+    inspect.unwrap(EnvWorker.evaluate)(worker, None, None)
+    assert len(requests) == 1
+    assert requests[0]["rlt_switch_flags"].tolist() == [True]
+
+
+def test_arx_timeout_ends_drag_in_hold_and_routes_can_switch_both_ways(arx_env):
+    env, arm = arx_env.env, arx_env.arm
+    env.reset()
+    env.handle_operator_event("actor")
+    assert env.rlt_switch_flags
+    env.handle_operator_event("reference")
+    assert not env.rlt_switch_flags
+    env.handle_operator_event("drag")
+    env.config.max_episode_steps = 1
+    anchor = arm.get_state().tcp_pose
+    action = env.codec.encode_action(anchor, 0.04, anchor)
+    transition = env.step(action)
+    assert transition[3]
+    assert arm.get_state().mode == "hold"

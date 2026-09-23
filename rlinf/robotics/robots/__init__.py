@@ -17,6 +17,7 @@
 Importing this package registers each robot type and its discovery metadata.
 """
 
+from .arx5 import Arx5Config, Arx5Robot
 from .dosw1 import DOSW1Robot, DOSW1RobotConfig
 from .dual_franka import DualFrankaConfig, DualFrankaRobot
 from .franka import FrankaConfig, FrankaRobot
@@ -26,6 +27,8 @@ from .so101 import SO101Config, SO101Robot
 from .turtle2 import Turtle2Config, Turtle2Robot
 
 __all__ = [
+    "Arx5Config",
+    "Arx5Robot",
     "DOSW1Robot",
     "DOSW1RobotConfig",
     "DualFrankaConfig",

@@ -151,6 +151,10 @@ class EnvTransition:
     intervene_flags: torch.Tensor | None = None
     # RLT route chosen per action, usually bool/int [B, C].
     rlt_switch_flags: torch.Tensor | None = None
+    # Confirmed environment actions after command arbitration, float [B, D].
+    executed_actions: torch.Tensor | None = None
+    # Whether this entire fixed-length chunk is eligible for replay, bool [B, 1].
+    transition_valid: torch.Tensor | None = None
     # External reward-model scores aligned with ``rewards``, float [B, C].
     reward_model_output: torch.Tensor | None = None
     # History lengths used for delayed reward assignment; one int per env [B].
@@ -167,6 +171,8 @@ class EnvTransition:
             "intervene_actions",
             "intervene_flags",
             "rlt_switch_flags",
+            "executed_actions",
+            "transition_valid",
             "reward_model_output",
         ):
             value = getattr(self, field_name)
@@ -200,6 +206,8 @@ class EnvTransition:
                 "intervene_actions",
                 "intervene_flags",
                 "rlt_switch_flags",
+                "executed_actions",
+                "transition_valid",
             )
         }
 
@@ -710,6 +718,19 @@ class TrajectoryStep:
                 else None
             ),
         )
+        if env.transition.executed_actions is not None:
+            executed = env.transition.executed_actions
+            if step.actions is None or executed.shape != step.actions.shape:
+                raise ValueError(
+                    "Executed actions must match the policy action layout."
+                )
+            step.actions = executed.cpu().contiguous()
+            step.forward_inputs["action"] = step.actions
+            step.forward_inputs.pop("model_action", None)
+        if env.transition.transition_valid is not None:
+            step.forward_inputs["transition_valid"] = (
+                env.transition.transition_valid.bool()
+            )
         if env.transition.intervene_actions is not None:
             step.apply_interventions(
                 env.transition.intervene_actions,
@@ -786,10 +807,24 @@ class TrajectoryStep:
             if env.next_rlt_obs is None:
                 raise ValueError("RLT transitions require next-state features.")
             current_obs = extract_rlt_obs_from_forward_inputs(self.forward_inputs)
+            reference_interventions = env.transition.intervene_flags
+            preserve_reference = self.forward_inputs.get("preserve_rlt_reference")
+            if preserve_reference is not None and reference_interventions is not None:
+                preserve_reference = (
+                    preserve_reference.bool()
+                    .reshape(reference_interventions.shape[0], -1)
+                    .all(dim=-1, keepdim=True)
+                )
+                reference_interventions = (
+                    reference_interventions.reshape(
+                        reference_interventions.shape[0], -1
+                    )
+                    & ~preserve_reference
+                )
             apply_rlt_interventions(
                 current_obs,
                 env.transition.intervene_actions,
-                env.transition.intervene_flags,
+                reference_interventions,
             )
             next_obs = env.next_rlt_obs
         elif collect_transitions:
@@ -1643,6 +1678,7 @@ class EnvOutput:
         )
 
         return {
+            **obs,
             "main_images": image_tensor,  # [N_ENV, H, W, C]
             "wrist_images": wrist_image_tensor,  # [N_ENV, H, W, C] or [N_ENV, N_IMG, H, W, C]
             "extra_view_images": extra_view_image_tensor,  # [N_ENV, N_IMG, H, W, C]

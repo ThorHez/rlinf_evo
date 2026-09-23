@@ -62,6 +62,20 @@
 
    </div>
 
+ARX 与 RL Token
+---------------
+
+ARX 指南说明本机 SDK 控制、GoPro 观测、同臂拖动介入与同步 Stage 2 训练。
+
+.. grid:: 1 2 2 2
+   :gutter: 2
+
+   .. grid-item-card:: ARX
+      :link: embodied/arx5_rlt
+      :link-type: doc
+
+      配置 checkpoint 与实测时序，验证机械臂后运行训练与评估。
+
 Piper 与 SO101 配置
 --------------------------------
 
@@ -91,5 +105,6 @@ Piper 与 SO101 配置
    GimArm <embodied/gim_arm>
    XSquare Turtle2 <embodied/xsquare_turtle2>
    DOS-W1 <embodied/dosw1>
+   ARX <embodied/arx5_rlt>
    Piper <embodied/piper>
    SO101 <embodied/so101>

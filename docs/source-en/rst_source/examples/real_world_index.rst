@@ -62,6 +62,20 @@ Choose a guide for hardware checks, teleoperation, data collection, sim-to-real 
 
    </div>
 
+ARX with RL Token
+-----------------
+
+Use the ARX guide for local SDK control, GoPro observations, drag interventions, and synchronous Stage 2 training.
+
+.. grid:: 1 2 2 2
+   :gutter: 2
+
+   .. grid-item-card:: ARX
+      :link: embodied/arx5_rlt
+      :link-type: doc
+
+      Configure the checkpoint and measured timing, validate the arm, then train and evaluate.
+
 Piper and SO101 Setup
 ---------------------
 
@@ -91,5 +105,6 @@ Use these guides to connect an arm and run its hardware test script. Piper and S
    GimArm <embodied/gim_arm>
    XSquare Turtle2 <embodied/xsquare_turtle2>
    DOS-W1 <embodied/dosw1>
+   ARX <embodied/arx5_rlt>
    Piper <embodied/piper>
    SO101 <embodied/so101>

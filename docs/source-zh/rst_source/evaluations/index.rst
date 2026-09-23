@@ -69,6 +69,8 @@ Benchmark 指南
      - 流程
    * - :doc:`RealWorld <guides/realworld>`
      - Franka 真机评测与部署。
+   * - :doc:`ARX RL Token <../examples/embodied/arx5_rlt>`
+     - 使用相同的 ARX 观测与拖动接管流程运行固定权重 RL Token。
    * - :doc:`BEHAVIOR-1K <guides/behavior>`
      - BEHAVIOR-1K 评测。
    * - :doc:`LIBERO <guides/libero>`

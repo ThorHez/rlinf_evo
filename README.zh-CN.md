@@ -30,6 +30,8 @@ RLinf 是一个灵活且可扩展的开源框架，专为具身智能和智能�
 
 ## 最新动态
 
+- [2026/09] 新增 ARX SDK/UVC 适配与支持拖动介入的同步 RL Token Stage 2 配置，真机运行前仍需完成硬件验收。文档：[ARX RL Token](docs/source-zh/rst_source/examples/embodied/arx5_rlt.rst)。
+
 - [2026/09] 🔥 RLinf 支持 [FastWAM](https://github.com/yuantianyuan01/FastWAM) 的 FSDP 监督微调与 LIBERO 批量评测。文档：[FastWAM 评测与监督微调](https://rlinf.readthedocs.io/zh-cn/latest/rst_source/examples/embodied/sft_fastwam.html)。
 - [2026/08] 🔥 RLinf 支持对英伟达全模态世界模型 Cosmos3 做 SFT 及基于 SGLang 的评测。文档：[Cosmos3 SFT](https://rlinf.readthedocs.io/zh-cn/latest/rst_source/examples/embodied/sft_cosmos3.html)、[SGLang 评测](https://rlinf.readthedocs.io/zh-cn/latest/rst_source/evaluations/guides/cosmos3_sglang.html)。
 - [2026/08] 🎉 RLinf 正式入选 **PyTorch 生态**！我们将继续把可扩展的具身与智能体强化学习带给 PyTorch 用户，推动模型智能走进真实世界。博客：[PyTorch Ecosystem Landscape Q3 Update](https://pytorch.org/blog/pytorch-ecosystem-landscape-q3-update/)。

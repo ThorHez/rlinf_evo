@@ -1,0 +1,23 @@
+# Fixed Stage 2 weights; the same frozen Stage 1 and environment contract as training.
+defaults:
+- realworld_arx5_rlt_stage2_ac_mlp
+- _self_
+runner:
+  task_type: embodied_eval
+  only_eval: true
+  max_epochs: 1
+  val_check_interval: 1
+  save_interval: -1
+  resume_dir: null
+  ckpt_path: ${oc.env:RLT_STAGE2_WEIGHTS}
+  logger:
+    experiment_name: realworld_arx5_rlt_stage2_eval
+env:
+  eval:
+    override_cfg:
+      start_with_actor: true
+    video_cfg:
+      save_video: false
+rollout:
+  collect_transitions: false
+  model: ${actor.model}

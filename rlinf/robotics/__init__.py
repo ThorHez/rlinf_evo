@@ -55,6 +55,8 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from .parts.views import MethodArm, MethodCamera, MethodEndEffector
     from .robot import Robot
     from .robots import (
+        Arx5Config,
+        Arx5Robot,
         DOSW1Robot,
         DOSW1RobotConfig,
         DualFrankaConfig,
@@ -90,6 +92,8 @@ _MODULE_GROUPS: dict[str, tuple[str, ...]] = {
     ".robot": ("Robot",),
     ".parts.views": ("MethodArm", "MethodCamera", "MethodEndEffector"),
     ".robots": (
+        "Arx5Config",
+        "Arx5Robot",
         "DOSW1Robot",
         "DOSW1RobotConfig",
         "DualFrankaConfig",
@@ -130,6 +134,8 @@ __all__ = [
     "Action",
     "Arm",
     "ArmState",
+    "Arx5Config",
+    "Arx5Robot",
     "BaseArm",
     "BaseCamera",
     "BaseGripper",

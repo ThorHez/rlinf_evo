@@ -537,3 +537,271 @@ def test_redirected_entrypoint_failure_is_not_reported_as_success(tmp_path):
 
     assert result.returncode == 1, result.stderr
     assert "entrypoint failed" in (tmp_path / "exp" / "log" / "main.log").read_text()
+
+
+def _eef_codec_stats():
+    """Distinct XYZ ranges expose swapped state/action or min/quantile stats."""
+    return {
+        key: {
+            "min": [-0.4, -0.1, 0.03] + [-9.0] * (dim - 3),
+            "max": [0.6, 0.3, 0.03] + [9.0] * (dim - 3),
+            "q01": [-0.2, -0.05, -0.08] + [-1.0] * (dim - 3),
+            "q99": [0.2, 0.05, 0.08] + [1.0] * (dim - 3),
+        }
+        for key, dim in (("state", 16), ("actions", 10))
+    }
+
+
+def test_eef_codec_roundtrip_uses_fixed_anchor_and_rotation_rows():
+    from scipy.spatial.transform import Rotation
+
+    from rlinf.algorithms.rlt.action_codec import EEFActionCodec
+
+    codec = EEFActionCodec(_eef_codec_stats())
+    anchor_rotation = Rotation.from_euler("xyz", [0.4, -0.6, 1.2])
+    relative_rotation = Rotation.from_euler(
+        "xyz", [[-0.3, 0.2, 0.8], [0.7, 0.4, -0.2], [0.1, -0.9, 0.3]]
+    )
+    anchor = np.r_[[0.3, -0.2, 0.4], anchor_rotation.as_quat()]
+    relative_xyz = np.array([[0.1, 0.2, 0.3], [0.3, -0.1, 0.4], [-0.2, 0.4, 0.1]])
+    poses = np.c_[
+        anchor_rotation.apply(relative_xyz) + anchor[:3],
+        (anchor_rotation * relative_rotation).as_quat(),
+    ]
+    widths = np.array([0.012, 0.045, 0.083])
+    encoded = codec.encode_action(poses, widths, anchor)
+    raw = codec.unnormalize_action(encoded)
+    np.testing.assert_allclose(raw[:, :3], relative_xyz, atol=1e-12)
+    np.testing.assert_allclose(
+        raw[:, 3:9], relative_rotation.as_matrix()[:, :2, :].reshape(3, 6), atol=1e-12
+    )
+    assert not np.allclose(
+        raw[:, 3:9], relative_rotation.as_matrix()[:, :, :2].reshape(3, 6)
+    )
+    recovered, recovered_widths = codec.decode_action(encoded, anchor)
+    np.testing.assert_allclose(recovered[:, :3], poses[:, :3], atol=1e-12)
+    np.testing.assert_allclose(
+        Rotation.from_quat(recovered[:, 3:]).as_matrix(),
+        Rotation.from_quat(poses[:, 3:]).as_matrix(),
+        atol=1e-12,
+    )
+    np.testing.assert_array_equal(recovered_widths, widths)
+    one_pose, one_width = codec.decode_action(encoded[1], anchor)
+    np.testing.assert_allclose(one_pose[:3], poses[1, :3], atol=1e-12)
+    assert one_width == widths[1]
+
+
+@pytest.mark.parametrize("use_minmax", [True, False])
+def test_eef_codec_normalization_matches_openpi_transform_and_never_clips(use_minmax):
+    from rlinf.algorithms.rlt.action_codec import EEFActionCodec
+    from rlinf.models.embodiment.openpi.policies.umi_policy import UmiV4Normalize
+
+    stats = _eef_codec_stats()
+    if not use_minmax:
+        for entry in stats.values():
+            entry.pop("min")
+            entry.pop("max")
+    codec = EEFActionCodec(stats)
+    actions = np.linspace(-0.6, 0.7, 160).reshape(16, 10)
+    normalized = codec.normalize_action(actions)
+    expected = UmiV4Normalize.from_stats(stats)({"actions": actions})["actions"]
+    np.testing.assert_array_equal(normalized, expected)
+    np.testing.assert_allclose(
+        codec.unnormalize_action(normalized), actions, atol=1e-12
+    )
+    np.testing.assert_array_equal(normalized[:, 3:], actions[:, 3:])
+    assert np.any(np.abs(normalized[:, :3]) > 1.0)
+    if use_minmax:
+        np.testing.assert_array_equal(normalized[:, 2], actions[:, 2] - 0.03)
+
+
+def test_eef_codec_observation_history_and_checkpoint_file(tmp_path):
+    import json
+
+    from scipy.spatial.transform import Rotation
+
+    from rlinf.algorithms.rlt.action_codec import EEFActionCodec
+    from rlinf.models.embodiment.openpi.policies.umi_policy import UmiV4Normalize
+
+    stats = _eef_codec_stats()
+    path = tmp_path / "norm_stats.json"
+    path.write_text(json.dumps({"norm_stats": stats}))
+    codec = EEFActionCodec.from_stats_json(path)
+    rotations = Rotation.from_euler("xyz", [[0.2, 0.4, 0.7], [-0.3, 0.5, 0.2]])
+    poses = np.c_[[[0.2, 0.3, 0.4], [0.3, 0.2, 0.5]], rotations.as_quat()]
+    start_rotation = Rotation.from_euler("xyz", [-0.5, -0.1, 0.3])
+    start = np.r_[[0.1, 0.2, 0.3], start_rotation.as_quat()]
+    fields = codec.encode_observation(poses, np.array([0.02, 0.06]), start)
+    np.testing.assert_allclose(fields["robot0_eef_pos"][-1], 0, atol=1e-12)
+    np.testing.assert_allclose(
+        fields["robot0_eef_rot_axis_angle"][-1], [1, 0, 0, 0, 1, 0], atol=1e-12
+    )
+    expected_start = (
+        (start_rotation.inv() * rotations).as_matrix()[:, :2, :].reshape(2, 6)
+    )
+    np.testing.assert_allclose(
+        fields["robot0_eef_rot_axis_angle_wrt_start"], expected_start, atol=1e-12
+    )
+    raw = codec.flatten_observation(fields).reshape(2, 16)
+    normalized = codec.flatten_observation(fields, normalize=True)
+    oracle = UmiV4Normalize.from_stats(stats)({"state": raw})["state"]
+    np.testing.assert_allclose(normalized, oracle.reshape(32), atol=1e-7)
+    np.testing.assert_allclose(raw[:, -1], [0.02, 0.06], atol=1e-8)
+
+
+def test_eef_codec_rejects_bad_geometry_and_stats():
+    from rlinf.algorithms.rlt.action_codec import EEFActionCodec
+
+    codec = EEFActionCodec(_eef_codec_stats())
+    anchor = np.array([0, 0, 0, 0, 0, 0, 1.0])
+    for action, message in [
+        (np.full(10, np.nan), "finite"),
+        (np.zeros(10), "nonzero"),
+        (np.array([0, 0, 0, 1, 0, 0, 2, 0, 0, 0]), "independent"),
+    ]:
+        with pytest.raises(ValueError, match=message):
+            codec.decode_action(action, anchor)
+    with pytest.raises(ValueError, match="quaternion"):
+        codec.encode_action(np.zeros(7), 0.02, anchor)
+    with pytest.raises(ValueError, match="one anchor"):
+        codec.encode_action(anchor, 0.02, np.stack((anchor, anchor)))
+    with pytest.raises(ValueError, match="shape"):
+        codec.encode_observation(anchor[None], np.array([0.02]), anchor)
+    stats = _eef_codec_stats()
+    stats["actions"]["max"][0] = -2.0
+    with pytest.raises(ValueError, match="upper bounds"):
+        EEFActionCodec(stats)
+
+
+_ARX_REQUIRED_ENV = {
+    "RLT_STAGE1_CHECKPOINT": "/tmp/arx-stage1-test-checkpoint",
+    "RLT_NORM_STATS": "/tmp/arx-test-norm_stats.json",
+    "ARX_ACTION_DT": "0.05",
+    "ARX_HISTORY_DT": "0.05",
+    "ARX_CAMERA_LATENCY": "0.08",
+    "ARX_GRIPPER_MIN": "0.0",
+    "ARX_GRIPPER_MAX": "0.085",
+    "ARX_CAMERA_DEVICE": "/dev/v4l/by-id/fake-arx-camera",
+    "ARX_TASK_DESCRIPTION": "pick the test object",
+    "RLT_STAGE2_WEIGHTS": "/tmp/arx-stage2-test-weights.pt",
+}
+
+
+def _compose_arx_config(monkeypatch, *, algorithm="ac", evaluation=False):
+    from hydra import compose, initialize_config_dir
+
+    config_dir = Path(__file__).resolve().parents[2] / "examples/embodiment/config"
+    monkeypatch.setenv("EMBODIED_PATH", str(config_dir.parent))
+    monkeypatch.delenv("ARX_ENDPOINT", raising=False)
+    suffix = (
+        ("eval" if algorithm == "ac" else "td3_eval")
+        if evaluation
+        else f"{algorithm}_mlp"
+    )
+    name = f"realworld_arx5_rlt_stage2_{suffix}"
+    with initialize_config_dir(config_dir=str(config_dir), version_base="1.1"):
+        return compose(config_name=name)
+
+
+@pytest.mark.parametrize("evaluation", [False, True])
+@pytest.mark.parametrize("algorithm", ["ac", "td3"])
+def test_arx_stage2_configs_share_model_contract_and_resolve_without_hardware(
+    monkeypatch, algorithm, evaluation
+):
+    from rlinf.config import validate_only_eval_rollout_model
+    from rlinf.envs.real.arx5.rlt import Arx5RLTEnvConfig
+    from rlinf.robotics.robots.arx5 import Arx5Config
+
+    for name, value in _ARX_REQUIRED_ENV.items():
+        monkeypatch.setenv(name, value)
+    cfg = _compose_arx_config(monkeypatch, algorithm=algorithm, evaluation=evaluation)
+    OmegaConf.resolve(cfg)
+    assert cfg.cluster.num_nodes == 1
+    assert cfg.runner.only_eval is evaluation
+    assert cfg.runner.rtc.enabled is False
+    assert cfg.runner.enable_decoupled_mode is False
+    assert cfg.algorithm.loss_type == f"rlt_{algorithm}"
+    assert cfg.algorithm.replay_buffer.filter_invalid_transitions is True
+    assert cfg.algorithm.reference_dropout_prob == 0.0
+    actor = cfg.actor.model
+    assert actor.model_type == (
+        "rlt_mlp_policy" if algorithm == "ac" else "rlt_td3_mlp_policy"
+    )
+    if algorithm == "td3":
+        assert cfg.algorithm.adv_type == "rlt_td3"
+        assert cfg.algorithm.actor_agg_q == "min"
+        assert cfg.algorithm.critic_actor_ratio == 2
+        assert cfg.algorithm.actor_update_action_noise is True
+        assert actor.actor_noise_sigma == 0.1
+    else:
+        assert cfg.algorithm.actor_agg_q == "q1"
+        assert cfg.algorithm.critic_actor_ratio == 4
+        assert actor.fixed_std == 0.002
+    assert (actor.action_dim, actor.proprio_dim, actor.num_action_chunks) == (
+        10,
+        32,
+        16,
+    )
+    assert actor.ref_num_action_chunks == 16
+    assert actor.action_parameterization == "eef_rot6d"
+    assert list(actor.eef_residual_scale) == [0.1] * 9 + [0.005]
+    assert (actor.gripper_width_min, actor.gripper_width_max) == (0.0, 0.085)
+    validate_only_eval_rollout_model(cfg.rollout.model)
+    assert cfg.rollout.model == actor
+    feature = cfg.rollout.rlt_feature_model
+    assert feature.model_path == _ARX_REQUIRED_ENV["RLT_STAGE1_CHECKPOINT"]
+    assert feature.openpi.config_name == "pi05_umi_v4"
+    assert feature.openpi.task == "eval"
+    assert feature.openpi.use_rlt is True
+    assert (feature.openpi.action_horizon, feature.action_dim) == (16, 10)
+    assert feature.openpi.model_action_dim == 32
+    hardware = Arx5Config(
+        **OmegaConf.to_container(cfg.cluster.node_groups[1].hardware.configs[0])
+    )
+    assert hardware.node_rank == 0
+    assert hardware.endpoint == "tcp://127.0.0.1:5557"
+    for mode in ("train", "eval"):
+        env = cfg.env[mode]
+        assert env.ros_setup is False
+        assert env.teleop == "none"
+        assert env.keyboard_reward_wrapper is None
+        assert env.init_params.id == "Arx5RLTEnv-v1"
+        assert env.max_episode_steps % actor.num_action_chunks == 0
+        assert env.max_steps_per_rollout_epoch % actor.num_action_chunks == 0
+        assert len(env.model_obs_keys) == 5
+        parsed = Arx5RLTEnvConfig(**OmegaConf.to_container(env.override_cfg))
+        assert parsed.norm_stats_path == feature.openpi_data.norm_stats_path
+        assert parsed.start_paused is True
+        assert parsed.action_dt == 0.05
+        assert parsed.camera_latency == 0.08
+        assert parsed.camera_pixel_format == "MJPG"
+        assert parsed.gripper_width_min == actor.gripper_width_min
+        assert parsed.gripper_width_max == actor.gripper_width_max
+        assert parsed.start_with_actor is (evaluation and mode == "eval")
+    if evaluation:
+        assert cfg.runner.ckpt_path == _ARX_REQUIRED_ENV["RLT_STAGE2_WEIGHTS"]
+        assert cfg.rollout.collect_transitions is False
+    else:
+        assert cfg.runner.ckpt_path is None
+        assert cfg.rollout.collect_transitions is True
+    assert actor.model_path is None
+    assert cfg.runner.resume_dir is None
+
+
+@pytest.mark.parametrize("missing", list(_ARX_REQUIRED_ENV))
+@pytest.mark.parametrize("evaluation", [False, True])
+@pytest.mark.parametrize("algorithm", ["ac", "td3"])
+def test_arx_stage2_configs_refuse_missing_model_and_calibration_inputs(
+    monkeypatch, algorithm, evaluation, missing
+):
+    from omegaconf.errors import InterpolationResolutionError
+
+    for name, value in _ARX_REQUIRED_ENV.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv(missing, raising=False)
+    cfg = _compose_arx_config(monkeypatch, algorithm=algorithm, evaluation=evaluation)
+    if missing == "RLT_STAGE2_WEIGHTS" and not evaluation:
+        OmegaConf.resolve(cfg)
+        return
+    with pytest.raises(InterpolationResolutionError, match=missing):
+        OmegaConf.resolve(cfg)

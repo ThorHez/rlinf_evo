@@ -1,0 +1,31 @@
+# Runtime choices for codex/umi-rlt-sft-resume on the RTX 4090 host.
+# OpenPI metadata pins torch 2.7.1; RLinf uses torch 2.11.0 instead.
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
+torchaudio==2.11.0+cu128
+torchcodec==0.11.1
+numpy==1.26.4
+pandas==2.2.3
+datasets==3.6.0
+transformers==4.53.2
+tokenizers==0.21.4
+peft==0.17.1
+opencv-python==4.11.0.86
+protobuf>=6.33.5,<7
+setuptools>=69.5.1,<75.9
+jax==0.5.3
+jaxlib==0.5.3
+orbax-checkpoint==0.11.13
+flax==0.10.2
+# OpenPI 0.5.3-era JAX stack; avoid later JAX-only APIs.
+optax==0.2.4
+chex==0.1.90
+equinox==0.12.2
+ml-dtypes==0.5.4
+numpydantic==1.6.9
+opencv-python-headless==4.11.0.86
+zarr==2.18.3
+numcodecs==0.13.1
+lerobot @ git+https://github.com/huggingface/lerobot.git@0cf864870cf29f4738d3ade893e6fd13fbd7cdb5
+diffusers==0.33.1
+rerun-sdk==0.22.1

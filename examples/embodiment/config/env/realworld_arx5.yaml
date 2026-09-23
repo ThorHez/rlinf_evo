@@ -1,0 +1,55 @@
+env_type: real
+ros_setup: false
+total_num_envs: 1
+auto_reset: true
+ignore_terminations: false
+reward_mode: raw
+wrap_obs_mode: simple
+seed: 1234
+group_size: 1
+use_fixed_reset_state_ids: false
+max_steps_per_rollout_epoch: 64
+max_episode_steps: 320
+teleop: none
+keyboard_reward_wrapper: null
+main_image_key: wrist_1
+model_obs_keys:
+  - robot0_eef_pos
+  - robot0_eef_rot_axis_angle
+  - robot0_eef_rot_axis_angle_wrt_start
+  - robot0_gripper_width
+  - left_wrist_0_rgb_1
+
+video_cfg:
+  save_video: false
+  info_on_video: true
+  video_base_dir: ${runner.logger.log_path}/video/arx5
+
+init_params:
+  id: Arx5RLTEnv-v1
+  num_envs: 1
+
+override_cfg:
+  norm_stats_path: ${oc.env:RLT_NORM_STATS}
+  # Seconds, measured/derived from the actual training data and camera path.
+  action_dt: ${oc.decode:${oc.env:ARX_ACTION_DT}}
+  history_dt: ${oc.decode:${oc.env:ARX_HISTORY_DT}}
+  camera_latency: ${oc.decode:${oc.env:ARX_CAMERA_LATENCY}}
+  gripper_width_min: ${oc.decode:${oc.env:ARX_GRIPPER_MIN}}
+  gripper_width_max: ${oc.decode:${oc.env:ARX_GRIPPER_MAX}}
+  task_description: ${oc.env:ARX_TASK_DESCRIPTION}
+  camera_device: ${oc.env:ARX_CAMERA_DEVICE}
+  camera_resolution: [1920, 1080]
+  camera_fps: 30
+  camera_pixel_format: MJPG
+  image_crop: null
+  max_frame_age: 0.5
+  max_state_gap: 0.05
+  observation_timeout: 3.0
+  history_seconds: 10.0
+  max_episode_steps: ${..max_episode_steps}
+  enable_keyboard: true
+  start_paused: true
+  start_with_actor: false
+  record_dir: ${runner.logger.log_path}/arx5_raw
+  is_dummy: false

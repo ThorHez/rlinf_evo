@@ -21,6 +21,7 @@ import io
 import json
 import random
 import time
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import AsyncMock, Mock, patch
@@ -2952,3 +2953,715 @@ def test_openpi_resume_rejects_incompatible_data_order(changed):
         state["consumed_samples"] = 63
     with pytest.raises(ValueError):
         restore_openpi_sft_iterator(loader, state)
+
+
+def test_arx_transition_split_merge_preserves_executed_actions_and_validity():
+    executed = torch.arange(60, dtype=torch.float32).reshape(3, 20)
+    valid = torch.tensor([[True], [False], [True]])
+    transition = EnvTransition(
+        executed_actions=executed,
+        transition_valid=valid,
+        rewards=torch.arange(6, dtype=torch.float32).reshape(3, 2),
+        dones=torch.tensor([[False, False], [False, True], [False, False]]),
+    )
+    shards = transition.split([1, 2])
+    torch.testing.assert_close(shards[1].executed_actions, executed[1:])
+    reconstructed = EnvTransition.merge(shards)
+    for field in ("executed_actions", "transition_valid", "rewards", "dones"):
+        torch.testing.assert_close(
+            getattr(reconstructed, field), getattr(transition, field)
+        )
+    exposed = reconstructed.to_dict()
+    torch.testing.assert_close(exposed["executed_actions"], executed)
+    torch.testing.assert_close(exposed["transition_valid"], valid)
+
+
+def _arx_trajectory_parts(preserve_reference=True):
+    batch, chunk, dim = 2, 2, 10
+    proposed = torch.zeros(batch, chunk * dim)
+    executed = torch.full_like(proposed, 0.3)
+    human = torch.full_like(proposed, 0.7)
+    reference = torch.full((batch, 16, dim), 0.2)
+    inputs = {
+        "action": proposed,
+        "model_action": proposed,
+        "z_rl": torch.ones(batch, 4),
+        "proprio": torch.ones(batch, 32),
+        "ref_chunk": reference,
+    }
+    if preserve_reference:
+        inputs["preserve_rlt_reference"] = torch.tensor([[True], [False]])
+    policy = PolicyPart(
+        sources=[_source(TrajectoryKey(0, 0, 0, 0, 0), size=batch)],
+        obs={"states": torch.zeros(batch, 32)},
+        output=PolicyOutput(forward_inputs=inputs),
+    )
+    env = EnvPart(
+        sources=policy.sources,
+        transition=EnvTransition(
+            rewards=torch.ones(batch, chunk),
+            dones=torch.zeros(batch, chunk, dtype=torch.bool),
+            executed_actions=executed,
+            transition_valid=torch.tensor([[True], [False]]),
+            intervene_actions=human,
+            intervene_flags=torch.tensor([[False, True], [True, False]]),
+        ),
+        next_rlt_obs={
+            "z_rl": torch.full((batch, 4), 2.0),
+            "proprio": torch.full((batch, 32), 2.0),
+            "ref_chunk": torch.full((batch, 16, dim), 0.4),
+        },
+    )
+    return policy, env
+
+
+@pytest.mark.parametrize("preserve_reference", [False, True])
+def test_arx_trajectory_actual_action_and_human_target_preserve_reference(
+    preserve_reference,
+):
+    policy, env = _arx_trajectory_parts(preserve_reference)
+    step = TrajectoryStep.from_parts(
+        policy,
+        env,
+        rewards=env.transition.rewards,
+        collect_prev_infos=False,
+        collect_transitions=True,
+        enable_rlt=True,
+        include_final_value=False,
+    )
+    expected = torch.tensor([[0.3] * 10 + [0.7] * 10, [0.7] * 10 + [0.3] * 10])
+    torch.testing.assert_close(step.actions, expected)
+    torch.testing.assert_close(step.forward_inputs["action"], expected)
+    assert "model_action" not in step.forward_inputs
+    assert step.intervene_flags[0].tolist() == [False] * 10 + [True] * 10
+    assert step.intervene_flags[1].tolist() == [True] * 10 + [False] * 10
+    torch.testing.assert_close(
+        step.forward_inputs["transition_valid"], torch.tensor([[True], [False]])
+    )
+    if preserve_reference:
+        torch.testing.assert_close(
+            step.curr_obs["ref_chunk"][0], policy.output.forward_inputs["ref_chunk"][0]
+        )
+    else:
+        torch.testing.assert_close(
+            step.curr_obs["ref_chunk"][0, 1], torch.full((10,), 0.7)
+        )
+    # Mixed batches retain legacy intervention replacement for the other row.
+    torch.testing.assert_close(step.curr_obs["ref_chunk"][1, 0], torch.full((10,), 0.7))
+    torch.testing.assert_close(
+        step.next_obs["ref_chunk"], env.next_rlt_obs["ref_chunk"]
+    )
+
+
+def test_arx_observation_fields_survive_env_and_policy_communication():
+    raw = {
+        "states": torch.zeros(2, 32),
+        "main_images": torch.zeros(2, 224, 224, 3, dtype=torch.uint8),
+        "task_descriptions": ["pick", "place"],
+        "robot0_eef_pos": torch.randn(2, 2, 3),
+        "robot0_eef_rot_axis_angle": torch.randn(2, 2, 6),
+        "robot0_eef_rot_axis_angle_wrt_start": torch.randn(2, 2, 6),
+        "robot0_gripper_width": torch.rand(2, 2, 1),
+        "left_wrist_0_rgb_1": torch.randint(
+            0, 255, (2, 224, 224, 3), dtype=torch.uint8
+        ),
+    }
+    output = EnvOutput(
+        obs=raw,
+        final_obs={
+            key: value.clone() if torch.is_tensor(value) else list(value)
+            for key, value in raw.items()
+        },
+    )
+    for observations in (output.to_dict()["obs"], output.to_dict()["final_obs"]):
+        for key in raw:
+            if torch.is_tensor(raw[key]):
+                torch.testing.assert_close(observations[key], raw[key])
+        policy = PolicyInput(obs=observations)
+        restored = PolicyInput.merge(policy.split([1, 1]))
+        for key in raw:
+            if torch.is_tensor(raw[key]):
+                torch.testing.assert_close(restored.obs[key], raw[key])
+
+
+def _arx_replay_trajectory(with_bootstrap=False):
+    # Each row has a distinct identity so row shifts cannot pass unnoticed.
+    identity = torch.arange(6, dtype=torch.float32).reshape(3, 2, 1)
+    initial = torch.ones(1, 2, 1, dtype=torch.bool)
+    terminal = torch.zeros(3, 2, 1, dtype=torch.bool)
+    terminal[1, 1] = True
+    valid = torch.tensor([True, False, False, True, True, False]).reshape(3, 2, 1)
+    human = torch.tensor([False, True, False, True, False, False]).reshape(3, 2, 1)
+    prev_values = identity + 10
+    if with_bootstrap:
+        prev_values = torch.cat((prev_values, torch.full((1, 2, 1), 999.0)))
+    return Trajectory(
+        actions=identity.expand(3, 2, 10).clone(),
+        rewards=identity + 0.5,
+        dones=torch.cat((initial, terminal)),
+        terminations=torch.cat((initial, terminal)),
+        truncations=torch.zeros(4, 2, 1, dtype=torch.bool),
+        intervene_flags=human.expand(3, 2, 10).clone(),
+        prev_values=prev_values,
+        forward_inputs={
+            "transition_valid": valid,
+            "action": identity.expand(3, 2, 10).clone(),
+        },
+        curr_obs={
+            "z_rl": identity,
+            "proprio": identity + 20,
+            "ref_chunk": identity.expand(3, 2, 160).clone(),
+        },
+        next_obs={
+            "z_rl": identity + 100,
+            "proprio": identity + 120,
+            "ref_chunk": (identity + 100).expand(3, 2, 160).clone(),
+        },
+    )
+
+
+@pytest.fixture
+def arx_replay_ingestion(monkeypatch):
+    from rlinf.data.storage.replay.buffer import TrajectoryReplayBuffer
+    from rlinf.workers.actor import fsdp_rlt_ac_policy_worker as worker_module
+
+    class Ingestor(worker_module.RLTACReplayMixin):
+        pass
+
+    ingestor = Ingestor()
+    ingestor.cfg = OmegaConf.create(
+        {
+            "env": {"train": {"env_type": "real"}},
+            "algorithm": {"replay_buffer": {"filter_invalid_transitions": True}},
+        }
+    )
+    ingestor.replay_buffer = TrajectoryReplayBuffer(seed=123)
+    ingestor.demo_buffer = TrajectoryReplayBuffer(seed=123)
+    owned_buffers = (ingestor.replay_buffer, ingestor.demo_buffer)
+    # Single-rank metric reduction; storage and ingestion use their real code.
+    monkeypatch.setattr(worker_module, "all_reduce_dict", lambda values: values)
+    yield ingestor
+    for buffer in owned_buffers:
+        buffer.close()
+
+
+def _sample_arx_replay(buffer):
+    # The buffer caps each draw to its stored row count and samples with
+    # replacement; repeat seeded public draws to cover the small fixture.
+    return merge_batch_values([buffer.sample(num_chunks=64) for _ in range(16)])
+
+
+@pytest.mark.parametrize("with_bootstrap", [False, True])
+def test_arx_replay_filters_invalid_rows_without_shifting_next_state_or_terminal(
+    arx_replay_ingestion, with_bootstrap
+):
+    ingestor = arx_replay_ingestion
+    added, completed = ingestor._ingest_rollout_trajectories(
+        [_arx_replay_trajectory(with_bootstrap)]
+    )
+    assert (added, completed) == (3, 1)
+    sample = _sample_arx_replay(ingestor.replay_buffer)
+    ids = sample["actions"][:, 0]
+    assert set(ids.tolist()) == {0.0, 3.0, 4.0}
+    torch.testing.assert_close(sample["curr_obs"]["z_rl"][:, 0], ids)
+    torch.testing.assert_close(sample["next_obs"]["z_rl"][:, 0], ids + 100)
+    torch.testing.assert_close(sample["rewards"][:, 0], ids + 0.5)
+    torch.testing.assert_close(sample["prev_values"][:, 0], ids + 10)
+    torch.testing.assert_close(sample["dones"][:, 0], ids == 3)
+    assert sample["forward_inputs"]["transition_valid"].all()
+    demo = ingestor.demo_buffer.sample(num_chunks=16)
+    assert torch.all(demo["actions"][:, 0] == 3)
+    assert demo["intervene_flags"].all()
+
+
+def test_arx_replay_filter_is_opt_in_and_requires_validity(arx_replay_ingestion):
+    ingestor = arx_replay_ingestion
+    trajectory = _arx_replay_trajectory()
+    trajectory.forward_inputs.pop("transition_valid")
+    with pytest.raises(ValueError, match="transition_valid"):
+        ingestor._ingest_rollout_trajectories([trajectory])
+    ingestor.cfg.algorithm.replay_buffer.filter_invalid_transitions = False
+    ingestor.demo_buffer = None
+    added, _ = ingestor._ingest_rollout_trajectories([trajectory])
+    assert added == 6
+    sample = _sample_arx_replay(ingestor.replay_buffer)
+    assert set(sample["actions"][:, 0].tolist()) == set(map(float, range(6)))
+
+
+def test_arx_replay_drops_entirely_invalid_chunks(arx_replay_ingestion):
+    trajectory = _arx_replay_trajectory()
+    trajectory.forward_inputs["transition_valid"].fill_(False)
+    assert arx_replay_ingestion._ingest_rollout_trajectories([trajectory]) == (0, 0)
+    assert arx_replay_ingestion.replay_buffer.size == 0
+    assert arx_replay_ingestion.demo_buffer.size == 0
+
+
+def test_arx_human_bc_learns_correction_without_reference_target_leakage():
+    from rlinf.models.embodiment.mlp_policy.rlt_mlp_policy import RLTMLPPolicy
+    from rlinf.workers.actor.fsdp_rlt_ac_policy_worker import RLTACLossMixin
+
+    actor = RLTMLPPolicy(
+        z_dim=4,
+        proprio_dim=32,
+        action_dim=10,
+        num_action_chunks=2,
+        ref_num_action_chunks=16,
+        action_parameterization="eef_rot6d",
+        gripper_width_max=0.085,
+    )
+    reference = (
+        torch.tensor([0, 0, 0, 1, 0, 0, 0, 1, 0, 0.04]).expand(2, 16, 10).clone()
+    )
+    obs = {
+        "z_rl": torch.zeros(2, 4),
+        "proprio": torch.zeros(2, 32),
+        "ref_chunk": reference,
+    }
+    actions, result = actor.predict_action_batch(obs, mode="eval")
+    policy, env = _arx_trajectory_parts()
+    policy.output = PolicyOutput(**result)
+    env.transition.executed_actions = actions.flatten(1)
+    corrected = actions.clone()
+    corrected[..., 0] += 0.2
+    corrected[..., 9] = 0.015
+    env.transition.intervene_actions = corrected.flatten(1)
+    step = TrajectoryStep.from_parts(
+        policy,
+        env,
+        rewards=env.transition.rewards,
+        collect_prev_infos=False,
+        collect_transitions=True,
+        enable_rlt=True,
+        include_final_value=False,
+    )
+    torch.testing.assert_close(step.curr_obs["ref_chunk"], reference)
+    pi, _, _ = actor.sac_forward(step.curr_obs, deterministic=True)
+    loss_worker = SimpleNamespace(
+        _flatten_chunk=RLTACLossMixin._flatten_chunk, _chunk_shape=lambda: (2, 10)
+    )
+    bc_loss, metrics = RLTACLossMixin._bc_metrics(
+        loss_worker,
+        pi,
+        step.actions,
+        step.curr_obs["ref_chunk"],
+        step.intervene_flags,
+    )
+    assert bc_loss.item() > 0 and metrics["bc_human_loss"] > 0
+    assert metrics["bc_ref_loss"] == 0.0
+    bc_loss.backward()
+    assert actor.actor_mean.weight.grad.abs().sum() > 0
+
+
+@pytest.fixture(params=["ac", "td3"])
+def arx_rlt_cpu_learner(request, monkeypatch):
+    """Run the production losses and update loop with a CPU FSDP adapter."""
+    from rlinf.data.storage.replay.buffer import TrajectoryReplayBuffer
+    from rlinf.data.storage.replay.dataset import ReplayBufferDataset
+    from rlinf.models.embodiment.mlp_policy.rlt_mlp_policy import RLTMLPPolicy
+    from rlinf.models.embodiment.mlp_policy.rlt_td3_mlp_policy import RLTTD3MLPPolicy
+    from rlinf.workers.actor import fsdp_rlt_ac_policy_worker as ac_worker
+    from rlinf.workers.actor.fsdp_rlt_td3_policy_worker import RLTTD3LossMixin
+    from rlinf.workers.actor.fsdp_sac_policy_worker import EmbodiedSACFSDPPolicy
+
+    mixin = ac_worker.RLTACLossMixin if request.param == "ac" else RLTTD3LossMixin
+
+    class CPUModel(torch.nn.Module):
+        # FSDP supplies this clipping method; all policy computation is real.
+        def __init__(self, policy):
+            super().__init__()
+            self.policy = policy
+
+        def forward(self, **kwargs):
+            return self.policy(**kwargs)
+
+        def clip_grad_norm_(self, max_norm):
+            return torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm)
+
+    class CPULearner(mixin, ac_worker.RLTACReplayMixin):
+        forward_actor = inspect.unwrap(mixin.forward_actor)
+        forward_critic = inspect.unwrap(mixin.forward_critic)
+        update_one_epoch = inspect.unwrap(EmbodiedSACFSDPPolicy.update_one_epoch)
+        soft_update_target_model = EmbodiedSACFSDPPolicy.soft_update_target_model
+
+        def worker_timer(self, _name):
+            return nullcontext()
+
+    torch.manual_seed(104)
+    kwargs = {
+        "z_dim": 4,
+        "proprio_dim": 32,
+        "action_dim": 10,
+        "num_action_chunks": 2,
+        "ref_num_action_chunks": 16,
+        "action_parameterization": "eef_rot6d",
+        "gripper_width_max": 0.085,
+    }
+    policy = (
+        RLTMLPPolicy(**kwargs, fixed_std=0.025)
+        if request.param == "ac"
+        else RLTTD3MLPPolicy(**kwargs, actor_noise_sigma=0.025, mlp_hidden_dim=32)
+    )
+    learner = CPULearner()
+    learner.algorithm = request.param
+    learner.model = CPUModel(policy)
+    learner.target_model = copy.deepcopy(learner.model)
+    learner.cfg = OmegaConf.create(
+        {
+            "env": {"train": {"env_type": "real"}},
+            "algorithm": {
+                "replay_buffer": {"filter_invalid_transitions": True},
+                "q_weight": 0.1,
+                "bc_weight": 5.0,
+                "gamma": 0.8,
+                "tau": 0.25,
+                "target_update_freq": 2,
+                "actor_agg_q": "q1" if request.param == "ac" else "min",
+                "actor_update_action_noise": True,
+            },
+            "actor": {
+                "model": {"num_action_chunks": 2, "action_dim": 10},
+                "global_batch_size": 3,
+                "micro_batch_size": 3,
+                "critic_optim": {"clip_grad": 100.0},
+                "optim": {"clip_grad": 100.0},
+            },
+        }
+    )
+    learner.device = torch.device("cpu")
+    learner.torch_dtype = torch.float32
+    learner._world_size = 1
+    learner.gradient_accumulation = 1
+    learner.enable_drq = False
+    learner.critic_actor_ratio = 2
+    learner.target_update_type = "all"
+    learner.target_model_initialized = True
+    learner.update_step = 0
+    learner.alpha_optimizer = None
+    learner.entropy_temp = SimpleNamespace(alpha=0.0)
+    learner.optimizer = torch.optim.Adam(
+        [p for name, p in learner.model.named_parameters() if "q_head" not in name],
+        lr=0.003,
+    )
+    learner.qf_optimizer = torch.optim.Adam(policy.q_head.parameters(), lr=0.003)
+    learner.lr_scheduler = torch.optim.lr_scheduler.ConstantLR(
+        learner.optimizer, factor=1.0
+    )
+    learner.qf_lr_scheduler = torch.optim.lr_scheduler.ConstantLR(
+        learner.qf_optimizer, factor=1.0
+    )
+    learner.replay_buffer = TrajectoryReplayBuffer(seed=3)
+    learner.demo_buffer = None
+    learner.buffer_dataloader_iter = iter(
+        ReplayBufferDataset(learner.replay_buffer, None, 3, 1, 0)
+    )
+    # Only the distributed metric reduction is replaced for this single rank.
+    monkeypatch.setattr(ac_worker, "all_reduce_dict", lambda values: values)
+    previous_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    yield learner
+    learner.replay_buffer.close()
+    torch.set_num_threads(previous_threads)
+
+
+def _arx_rlt_training_rollout(learner):
+    identity = torch.arange(4, dtype=torch.float32)
+    reference = torch.tensor([0, 0, 0, 1, 0, 0, 0, 1, 0, 0.04]).repeat(4, 16, 1)
+    reference[..., 0] = identity[:, None] / 10
+    obs = {
+        "z_rl": identity[:, None].expand(4, 4).clone(),
+        "proprio": identity[:, None].expand(4, 32).clone() / 10,
+        "ref_chunk": reference,
+    }
+    proposed, output = learner.model.policy.predict_action_batch(obs, mode="eval")
+    executed = proposed.clone()
+    executed[..., 0] += 0.025
+    human = proposed.clone()
+    human[..., 0] += 0.2
+    human[..., 9] = 0.015
+    flags = torch.tensor([[False, True], [True, False], [False, False], [True, True]])
+    terminal = torch.tensor(
+        [[False, False], [False, True], [False, False], [False, False]]
+    )
+    truncated = torch.tensor(
+        [[False, False], [False, False], [False, True], [False, False]]
+    )
+    policy = PolicyPart(
+        sources=[_source(TrajectoryKey(0, 0, 0, 0, 0), size=4)],
+        obs={"states": obs["proprio"]},
+        output=PolicyOutput(**output),
+    )
+    next_obs = {key: value.clone() for key, value in obs.items()}
+    next_obs["z_rl"] += 10
+    env = EnvPart(
+        sources=policy.sources,
+        transition=EnvTransition(
+            rewards=torch.arange(1, 9, dtype=torch.float32).reshape(4, 2),
+            dones=terminal | truncated,
+            terminations=terminal,
+            truncations=truncated,
+            executed_actions=executed.flatten(1),
+            intervene_actions=human.flatten(1),
+            intervene_flags=flags,
+            transition_valid=torch.tensor([[True], [True], [True], [False]]),
+        ),
+        next_rlt_obs=next_obs,
+    )
+    step = TrajectoryStep.from_parts(
+        policy,
+        env,
+        rewards=env.transition.rewards,
+        collect_prev_infos=False,
+        collect_transitions=True,
+        enable_rlt=True,
+        include_final_value=False,
+    )
+    expected_actions = torch.where(flags[..., None], human, executed).flatten(1)
+    torch.testing.assert_close(step.actions, expected_actions)
+    torch.testing.assert_close(step.curr_obs["ref_chunk"], reference)
+    trajectory = Trajectory.from_steps([step])
+    assert learner._ingest_rollout_trajectories([trajectory]) == (3, 2)
+    batch = _sample_arx_replay(learner.replay_buffer)
+    ids = batch["curr_obs"]["z_rl"][:, 0].long()
+    assert set(ids.tolist()) == {0, 1, 2}
+    torch.testing.assert_close(batch["actions"], expected_actions[ids])
+    torch.testing.assert_close(batch["curr_obs"]["ref_chunk"], reference[ids])
+    torch.testing.assert_close(batch["next_obs"]["z_rl"][:, 0], ids.float() + 10)
+    torch.testing.assert_close(
+        batch["intervene_flags"], flags[ids].repeat_interleave(10, 1)
+    )
+    assert batch["forward_inputs"]["transition_valid"].all()
+    return batch
+
+
+def test_arx_rlt_human_replay_optimizes_real_actor_and_critic(arx_rlt_cpu_learner):
+    from rlinf.models.embodiment.base_policy import ForwardType
+
+    learner = arx_rlt_cpu_learner
+    batch = _arx_rlt_training_rollout(learner)
+    # Use the same stochastic actor draw to verify the actual mixed objective.
+    torch.manual_seed(19)
+    pi, _, _ = learner.model(forward_type=ForwardType.SAC, obs=batch["curr_obs"])
+    human_mask = batch["intervene_flags"].reshape(-1, 2, 10).any(-1)
+    ref = batch["curr_obs"]["ref_chunk"][:, :2]
+    executed = batch["actions"].reshape(-1, 2, 10)
+    target = torch.where(human_mask[..., None], executed, ref)
+    expected_bc = (pi.reshape_as(target) - target).square().mean()
+    q_values = learner.model(
+        forward_type=ForwardType.SAC_Q, obs=batch["curr_obs"], actions=pi
+    )
+    expected_q = (
+        q_values[:, 0].mean()
+        if learner.algorithm == "ac"
+        else q_values.min(-1).values.mean()
+    )
+    torch.manual_seed(19)
+    actor_loss, _, metrics = learner.forward_actor(batch)
+    torch.testing.assert_close(actor_loss, -0.1 * expected_q + 5 * expected_bc)
+    assert metrics["bc_human_loss"] > metrics["bc_ref_loss"]
+    assert metrics["human_mask_ratio"] == pytest.approx(
+        human_mask.float().mean().item()
+    )
+
+    actor_before = {
+        n: p.detach().clone()
+        for n, p in learner.model.named_parameters()
+        if "q_head" not in n
+    }
+    critic_before = {
+        n: p.detach().clone() for n, p in learner.model.policy.q_head.named_parameters()
+    }
+    learner.optimizer.zero_grad(set_to_none=True)
+    actor_loss.backward()
+    gradients = [
+        p.grad
+        for n, p in learner.model.named_parameters()
+        if n in actor_before and p.grad is not None
+    ]
+    assert gradients and all(torch.isfinite(g).all() for g in gradients)
+    assert any(g.abs().sum() > 0 for g in gradients)
+    learner.optimizer.step()
+    assert any(
+        not torch.equal(p, actor_before[n])
+        for n, p in learner.model.named_parameters()
+        if n in actor_before
+    )
+    for name, parameter in learner.model.policy.q_head.named_parameters():
+        torch.testing.assert_close(parameter, critic_before[name], rtol=0, atol=0)
+
+    learner.model.zero_grad(set_to_none=True)
+    critic_loss, _ = learner.forward_critic(batch)
+    assert torch.isfinite(critic_loss)
+    critic_loss.backward()
+    assert all(p.grad is None for p in learner.target_model.parameters())
+    assert all(
+        p.grad is None for n, p in learner.model.named_parameters() if "q_head" not in n
+    )
+    assert all(
+        torch.isfinite(p.grad).all() for p in learner.model.policy.q_head.parameters()
+    )
+    learner.qf_optimizer.step()
+    assert any(
+        not torch.equal(p, critic_before[n])
+        for n, p in learner.model.policy.q_head.named_parameters()
+    )
+
+
+@pytest.mark.parametrize("bootstrap_type", ["standard", "always"])
+def test_arx_rlt_critic_bootstrap_uses_chunk_horizon_and_terminal_mask(
+    arx_rlt_cpu_learner, bootstrap_type
+):
+    from rlinf.models.embodiment.base_policy import ForwardType
+
+    learner = arx_rlt_cpu_learner
+    learner.cfg.algorithm.bootstrap_type = bootstrap_type
+    batch = _arx_rlt_training_rollout(learner)
+    # Give the target distinct parameters so selecting the online network fails.
+    with torch.no_grad():
+        for parameter in learner.target_model.parameters():
+            parameter.add_(0.01)
+        torch.manual_seed(23)
+        next_actor = (
+            learner.model if learner.algorithm == "ac" else learner.target_model
+        )
+        next_actions, _, _ = next_actor(
+            forward_type=ForwardType.SAC, obs=batch["next_obs"]
+        )
+        next_q = (
+            learner.target_model(
+                forward_type=ForwardType.SAC_Q,
+                obs=batch["next_obs"],
+                actions=next_actions,
+            )
+            .min(-1)
+            .values
+        )
+        discounted_reward = batch["rewards"][:, 0] + 0.8 * batch["rewards"][:, 1]
+        bootstrap = torch.ones_like(next_q)
+        if bootstrap_type == "standard":
+            bootstrap = (~batch["terminations"].any(-1)).float()
+        expected_target = discounted_reward + 0.8**2 * bootstrap * next_q
+        data_q = learner.model(
+            forward_type=ForwardType.SAC_Q,
+            obs=batch["curr_obs"],
+            actions=batch["actions"],
+        )
+        expected_loss = (data_q - expected_target[:, None]).square().mean()
+    torch.manual_seed(23)
+    actual_loss, _ = learner.forward_critic(batch)
+    torch.testing.assert_close(actual_loss, expected_loss)
+    actual_loss.backward()
+    assert all(p.grad is None for p in learner.target_model.parameters())
+
+
+def test_arx_rlt_production_update_delays_actor_and_updates_target(arx_rlt_cpu_learner):
+    learner = arx_rlt_cpu_learner
+    _arx_rlt_training_rollout(learner)
+    before = {n: p.detach().clone() for n, p in learner.model.named_parameters()}
+    target_before = {
+        n: p.detach().clone() for n, p in learner.target_model.named_parameters()
+    }
+    learner.update_step = 1
+    skipped = learner.update_one_epoch()
+    assert "sac/actor_loss" not in skipped
+    assert "sac/critic_loss" in skipped
+    assert any(
+        not torch.equal(p, before[n])
+        for n, p in learner.model.named_parameters()
+        if "q_head" in n
+    )
+    for name, parameter in learner.model.named_parameters():
+        if "q_head" not in name:
+            torch.testing.assert_close(parameter, before[name], rtol=0, atol=0)
+    for name, parameter in learner.target_model.named_parameters():
+        torch.testing.assert_close(parameter, target_before[name], rtol=0, atol=0)
+
+    learner.update_step = 2
+    updated = learner.update_one_epoch()
+    assert "sac/actor_loss" in updated
+    assert all(np.isfinite(float(value)) for value in updated.values())
+    assert any(
+        not torch.equal(p, before[n])
+        for n, p in learner.model.named_parameters()
+        if "q_head" not in n
+    )
+    online = dict(learner.model.named_parameters())
+    for name, parameter in learner.target_model.named_parameters():
+        torch.testing.assert_close(
+            parameter, 0.75 * target_before[name] + 0.25 * online[name]
+        )
+        assert parameter.grad is None
+
+
+@pytest.mark.parametrize("algorithm", ["ac", "td3"])
+@pytest.mark.parametrize("layout", ["step", "flat", "chunk"])
+@pytest.mark.parametrize("intervention", ["none", "policy", "human", "mixed"])
+def test_arx_rlt_bc_target_selection_and_gradients(algorithm, layout, intervention):
+    from rlinf.workers.actor.fsdp_rlt_ac_policy_worker import RLTACLossMixin
+    from rlinf.workers.actor.fsdp_rlt_td3_policy_worker import RLTTD3LossMixin
+
+    mixin = RLTACLossMixin if algorithm == "ac" else RLTTD3LossMixin
+    learner = mixin()
+    learner.cfg = OmegaConf.create(
+        {"actor": {"model": {"num_action_chunks": 2, "action_dim": 10}}}
+    )
+    pi = torch.zeros(2, 20, requires_grad=True)
+    reference = torch.tensor([[1.0, 2.0], [3.0, 4.0]])[..., None].expand(2, 2, 10)
+    human_actions = torch.tensor([[5.0, 6.0], [7.0, 8.0]])[..., None].expand(2, 2, 10)
+    mask = torch.zeros(2, 2, dtype=torch.bool)
+    if intervention == "human":
+        mask.fill_(True)
+    elif intervention == "mixed":
+        mask[0, 1] = mask[1, 0] = True
+    flags = mask if layout == "step" else mask[..., None].expand(2, 2, 10)
+    if layout == "flat":
+        flags = flags.flatten(1)
+    if intervention == "none":
+        flags = None
+    bc = learner._bc_metrics if algorithm == "ac" else learner._td3_bc_metrics
+    loss, metrics = bc(pi, human_actions, reference, flags)
+    target = torch.where(mask[..., None], human_actions, reference).flatten(1)
+    expected_loss = {"none": 7.5, "policy": 7.5, "human": 43.5, "mixed": 25.5}
+    assert loss.item() == pytest.approx(expected_loss[intervention])
+    assert metrics["human_mask_ratio"] == pytest.approx(mask.float().mean().item())
+    if intervention in ("none", "policy"):
+        assert metrics["bc_human_loss"] == 0.0
+    if intervention == "human":
+        assert metrics["bc_ref_loss"] == 0.0
+    loss.backward()
+    torch.testing.assert_close(pi.grad, -2 * target / target.numel())
+
+
+@pytest.mark.parametrize("algorithm", ["ac", "td3"])
+@pytest.mark.parametrize("shape", [(1, 2), (2, 3), (2, 2, 9), (4, 10)])
+def test_arx_rlt_bc_rejects_misaligned_intervention_masks(algorithm, shape):
+    from rlinf.workers.actor.fsdp_rlt_ac_policy_worker import RLTACLossMixin
+    from rlinf.workers.actor.fsdp_rlt_td3_policy_worker import RLTTD3LossMixin
+
+    mixin = RLTACLossMixin if algorithm == "ac" else RLTTD3LossMixin
+    learner = mixin()
+    learner.cfg = OmegaConf.create(
+        {"actor": {"model": {"num_action_chunks": 2, "action_dim": 10}}}
+    )
+    actions = torch.zeros(2, 20)
+    bc = learner._bc_metrics if algorithm == "ac" else learner._td3_bc_metrics
+    with pytest.raises(ValueError, match="[Mm]ask|[Ff]lag|intervene"):
+        bc(actions, actions, actions, torch.zeros(shape, dtype=torch.bool))
+
+
+@pytest.mark.parametrize(
+    ("aggregation", "expected"),
+    [("min", [3.0, 2.0]), ("q1", [3.0, 7.0]), ("mean", [4.0, 4.5])],
+)
+def test_arx_rlt_td3_actor_q_aggregation(aggregation, expected):
+    from rlinf.workers.actor.fsdp_rlt_td3_policy_worker import RLTTD3LossMixin
+
+    learner = RLTTD3LossMixin()
+    learner.cfg = OmegaConf.create({"algorithm": {"actor_agg_q": aggregation}})
+    twin_q = torch.tensor([[3.0, 5.0], [7.0, 2.0]], requires_grad=True)
+    result = learner._td3_actor_q(twin_q)
+    torch.testing.assert_close(result, torch.tensor(expected)[:, None])
+    result.sum().backward()
+    assert twin_q.grad is not None and torch.isfinite(twin_q.grad).all()
+    learner.cfg.algorithm.actor_agg_q = "unsupported"
+    with pytest.raises(ValueError, match="actor_agg_q"):
+        learner._td3_actor_q(twin_q)

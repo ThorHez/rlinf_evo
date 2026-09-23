@@ -6423,3 +6423,733 @@ def test_SE3_body_delta_compose_round_trip():
 
         assert np.allclose(T_rec[..., :3, :3], T_abs[..., :3, :3], atol=1e-6)
         assert np.allclose(T_rec[..., :3, 3], T_abs[..., :3, 3], atol=1e-6)
+
+
+def test_uvc_timestamped_reads_preserve_legacy_api_and_reconnect(tmp_path):
+    from robot_mocks.cameras import UVCCaptureFactory
+
+    from rlinf.robotics.parts.cameras import Camera, CameraInfo, UVCCamera
+
+    log = tmp_path / "capture.log"
+    info = CameraInfo(
+        name="wrist",
+        serial_number="/dev/v4l/by-id/fake-hdmi-capture",
+        camera_type="uvc",
+        resolution=(32, 24),
+        fps=30,
+    )
+    assert Camera.backend("uvc") is UVCCamera
+    camera = UVCCamera(info, capture_factory=UVCCaptureFactory(str(log)))
+    assert not camera.is_connected
+    assert not log.exists(), "constructing a camera opened the video device"
+    start = time.monotonic()
+    camera.connect()
+    try:
+        stamp, frame, sequence = camera.get_frame_with_timestamp(timeout=3)
+        assert start <= stamp <= time.monotonic()
+        assert sequence >= 1
+        assert frame.shape == (24, 32, 3)
+        assert frame.dtype == np.uint8
+        cached_stamp, cached, cached_sequence = camera.get_frame_with_timestamp(
+            timeout=0, max_age=1
+        )
+        assert (cached_stamp, cached_sequence) == (stamp, sequence)
+        np.testing.assert_array_equal(cached, frame)
+        cached[:] = 255
+        assert np.any(camera.get_frame(timeout=0, max_age=1) != 255)
+        observation = camera.get_observation(timeout=0, max_age=1)
+        assert set(observation) == {"frame"}
+        assert observation["frame"].shape == (24, 32, 3)
+        before_reopen = time.monotonic()
+        camera.reopen()
+        new_stamp, _, new_sequence = camera.get_frame_with_timestamp(timeout=3)
+        assert new_stamp > before_reopen
+        assert new_sequence > sequence
+    finally:
+        camera.disconnect()
+    camera.disconnect()
+    assert not camera.is_connected
+    lines = log.read_text().splitlines()
+    assert len([line for line in lines if line.startswith("open:")]) == 2
+    assert lines.count("release") == 2
+
+
+@pytest.mark.parametrize("failure", ["open", "format", "resolution", "fps"])
+def test_uvc_releases_handle_if_open_or_configuration_fails(tmp_path, failure):
+    from robot_mocks.cameras import UVCCaptureFactory
+
+    from rlinf.robotics.parts.cameras import CameraInfo, UVCCamera
+
+    log = tmp_path / "capture.log"
+    camera = UVCCamera(
+        CameraInfo("wrist", "/dev/v4l/by-id/fake", resolution=(32, 24), fps=30),
+        capture_factory=UVCCaptureFactory(str(log), failure),
+    )
+    with pytest.raises(RuntimeError, match="Failed to open|requested"):
+        camera.connect()
+    assert not camera.is_connected
+    assert log.read_text().splitlines()[-1] == "release"
+    camera.disconnect()
+
+
+@pytest.mark.parametrize("failure", ["read", "shape"])
+def test_uvc_failed_reads_release_and_retry_only_requested_attempts(tmp_path, failure):
+    import queue
+
+    from robot_mocks.cameras import UVCCaptureFactory
+
+    from rlinf.robotics.parts.cameras import CameraInfo, UVCCamera
+
+    log = tmp_path / "capture.log"
+    camera = UVCCamera(
+        CameraInfo("wrist", "/dev/v4l/by-id/fake", resolution=(32, 24), fps=30),
+        capture_factory=UVCCaptureFactory(str(log), failure),
+    )
+    camera.connect()
+    try:
+        with pytest.raises(queue.Empty, match="after 1 attempts"):
+            camera.get_frame_with_timestamp(timeout=0.2, attempts=1)
+    finally:
+        camera.disconnect()
+    lines = log.read_text().splitlines()
+    assert len([line for line in lines if line.startswith("open:")]) == 2
+    assert lines.count("release") == 2
+
+
+def test_uvc_stale_frame_is_rejected_and_reconnect_has_fresh_metadata(tmp_path):
+    import queue
+
+    from robot_mocks.cameras import UVCCaptureFactory
+
+    from rlinf.robotics.parts.cameras import CameraInfo, UVCCamera
+
+    log = tmp_path / "capture.log"
+    camera = UVCCamera(
+        CameraInfo("wrist", "/dev/v4l/by-id/fake", resolution=(32, 24), fps=30),
+        read_timeout=0.1,
+        capture_factory=UVCCaptureFactory(str(log), "one_frame"),
+    )
+    camera.connect()
+    try:
+        first_stamp, _, first_sequence = camera.get_frame_with_timestamp(timeout=3)
+        with pytest.raises(queue.Empty):
+            camera.get_frame_with_timestamp(timeout=0, max_age=1e-9)
+        stamp, _, sequence = camera.get_frame_with_timestamp(timeout=3)
+        assert stamp > first_stamp
+        assert sequence > first_sequence
+    finally:
+        camera.disconnect()
+
+
+@pytest.mark.parametrize("failure", ["read_hang", "close_hang"])
+def test_uvc_disconnect_is_bounded_when_native_driver_hangs(tmp_path, failure):
+    import multiprocessing
+
+    from robot_mocks.cameras import UVCCaptureFactory
+
+    from rlinf.robotics.parts.cameras import CameraInfo, UVCCamera
+
+    log = tmp_path / "capture.log"
+    previous_children = {p.pid for p in multiprocessing.active_children()}
+    camera = UVCCamera(
+        CameraInfo("wrist", "/dev/v4l/by-id/fake", resolution=(32, 24), fps=30),
+        read_timeout=0.1,
+        capture_factory=UVCCaptureFactory(str(log), failure),
+    )
+    camera.connect()
+    if failure == "close_hang":
+        camera.get_frame(timeout=3)
+    else:
+        deadline = time.monotonic() + 2
+        while "read_hang" not in log.read_text() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert "read_hang" in log.read_text()
+    start = time.monotonic()
+    camera.disconnect()
+    assert time.monotonic() - start < 3
+    assert not camera.is_connected
+    assert {p.pid for p in multiprocessing.active_children()} <= previous_children
+    if failure == "close_hang":
+        assert "release" in log.read_text()
+
+
+def test_uvc_open_timeout_does_not_leave_a_connected_camera(tmp_path):
+    from robot_mocks.cameras import UVCCaptureFactory
+
+    from rlinf.robotics.parts.cameras import CameraInfo, UVCCamera
+
+    log = tmp_path / "capture.log"
+    camera = UVCCamera(
+        CameraInfo("wrist", "/dev/v4l/by-id/fake"),
+        open_timeout=5,
+        capture_factory=UVCCaptureFactory(str(log), "open_hang"),
+    )
+    start = time.monotonic()
+    with pytest.raises(TimeoutError, match="open exceeded"):
+        camera.connect()
+    assert time.monotonic() - start < 8
+    assert log.exists(), "the native open was never entered"
+    assert not camera.is_connected
+    camera.disconnect()
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"serial_number": "0"},
+        {"serial_number": "/tmp/video.mp4"},
+        {"enable_depth": True},
+        {"fps": 0},
+        {"fps": float("nan")},
+        {"resolution": (0, 20)},
+        {"pixel_format": "invalid"},
+    ],
+)
+def test_uvc_rejects_invalid_device_configuration_without_opening(fields):
+    from rlinf.robotics.parts.cameras import CameraInfo, UVCCamera
+
+    defaults = {"name": "wrist", "serial_number": "/dev/v4l/by-id/fake"}
+    defaults.update(fields)
+    with pytest.raises(ValueError):
+        UVCCamera(CameraInfo(**defaults))
+
+
+@pytest.mark.parametrize("model", ["", "openpi"])
+def test_arx5_install_routes_client_dependencies_without_vendor_sdk(tmp_path, model):
+    """Exercise shell routing with package installs replaced at the process edge."""
+    installer = _ROOT / "requirements" / "install.sh"
+    library = tmp_path / "install-functions.sh"
+    source = installer.read_text()
+    assert source.rstrip().endswith('main "$@"')
+    library.write_text(source.rsplit('main "$@"', 1)[0])
+    command = r"""
+source "$1"
+ENV_NAME=arx5
+MODEL="$2"
+SCRIPT_DIR="$3"
+[[ " ${SUPPORTED_ENVS[*]} " == *" arx5 "* ]]
+create_and_sync_venv() { echo CREATE; }
+install_common_embodied_deps() { echo COMMON; }
+install_flash_attn() { echo FLASH; }
+uv() { echo "uv:$*"; }
+cp() { echo "cp:$*"; }
+python() { cat >/dev/null; echo 3.11; }
+bash() { echo "bash:$*"; }
+if [[ -n "$MODEL" ]]; then
+    install_openpi_model
+else
+    install_env_only
+fi
+"""
+    result = subprocess.run(
+        [
+            "bash",
+            "--noprofile",
+            "--norc",
+            "-c",
+            command,
+            "test",
+            str(library),
+            model,
+            str(installer.parent),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert "CREATE\nCOMMON\n" in result.stdout
+    assert (
+        f"uv:pip install -r {installer.parent}/embodied/envs/arx5.txt" in result.stdout
+    )
+    assert "arx5-sdk" not in result.stdout
+    if model:
+        assert "uv:pip install rlinf-openpi==0.1.1" in result.stdout
+        assert (
+            f"uv:pip install -r {installer.parent}/embodied/models/openpi.txt"
+            in result.stdout
+        )
+    else:
+        assert "rlinf-openpi" not in result.stdout
+
+
+# ARX tests exercise the real JSON transport and SDK adapter with fake CAN/IK.
+@pytest.fixture(params=["ipc", "tcp"])
+def arx_service(tmp_path, request):
+    import threading
+
+    from robot_mocks.arx5 import FakeArxController, FakeArxSDK, FakeArxSolver
+
+    from rlinf.robotics.parts.arms.arx5_protocol import (
+        Arx5Service,
+        MotionLimits,
+        SdkArx5Adapter,
+    )
+
+    controller, solver = FakeArxController(), FakeArxSolver()
+    adapter = SdkArx5Adapter(FakeArxSDK, controller, solver)
+    service = Arx5Service(
+        adapter,
+        allow_motion=True,
+        limits=MotionLimits(translation=0.05, rotation=0.2, gripper=0.05, joint=0.3),
+        sample_hz=200,
+        history_seconds=0.5,
+        command_timeout=0.2,
+    )
+    endpoint = f"ipc://{tmp_path / 'arx.sock'}"
+    if request.param == "tcp":
+        import socket
+
+        with socket.socket() as reservation:
+            reservation.bind(("127.0.0.1", 0))
+            port = reservation.getsockname()[1]
+        endpoint = f"tcp://127.0.0.1:{port}"
+    ready = threading.Event()
+    thread = threading.Thread(
+        target=service.serve, args=(endpoint,), kwargs={"ready": ready}
+    )
+    thread.start()
+    assert ready.wait(2.0), "ARX service failed to bind local ZMQ"
+    try:
+        yield SimpleNamespace(
+            endpoint=endpoint, service=service, controller=controller, solver=solver
+        )
+    finally:
+        service.stop()
+        thread.join(timeout=2.0)
+        assert not thread.is_alive(), "ARX ZMQ thread leaked"
+
+
+def test_arx_connection_is_deferred_and_gripper_shares_owner(arx_service):
+    from rlinf.robotics import Arx5Config, Arx5Robot
+    from rlinf.robotics.parts.arms import Arx5Arm
+
+    arm = Arx5Arm(arx_service.endpoint)
+    robot = Arx5Robot(arm=arm)
+    assert not arm.is_connected
+    assert Arm.backend("arx5_zmq") is Arx5Arm
+    assert RobotDiscovery.registry["ARX5"].config_cls is Arx5Config
+    robot.connect()
+    try:
+        state = arm.get_state()
+        assert state.mode == "disabled"
+        assert state.control_epoch == 0
+        assert arx_service.controller.command_count == 0
+        assert set(arm.get_observation()) == {
+            "tcp_pose",
+            "arm_joint_position",
+            "arm_joint_velocity",
+        }
+        assert arm.children["end_effector"].owner is arm
+        np.testing.assert_allclose(
+            arm.children["end_effector"].get_state(), [state.gripper_width]
+        )
+    finally:
+        robot.disconnect()
+        robot.disconnect()
+    assert arx_service.controller.command_count == 0
+
+
+def test_arx_drag_invalidates_old_commands_and_restores_measured_target(arx_service):
+    from rlinf.robotics.parts.arms import Arx5Arm
+    from rlinf.robotics.parts.arms.arx5_protocol import Arx5Error
+
+    arm = Arx5Arm(arx_service.endpoint)
+    operator = Arx5Arm(arx_service.endpoint)
+    arm.connect()
+    operator.connect()
+    try:
+        hold = arm.resume_hold()
+        policy = arm.enable_policy(hold.control_epoch)
+        target = policy.tcp_pose.copy()
+        target[0] += 0.01
+        arm.command_pose(target, policy.gripper_width, policy.control_epoch)
+        drag = operator.enter_drag()
+        assert drag.control_epoch > policy.control_epoch and drag.mode == "drag"
+        before = arx_service.controller.command_count
+        with pytest.raises(Arx5Error, match="stale_epoch"):
+            arm.command_pose(target, policy.gripper_width, policy.control_epoch)
+        assert arx_service.controller.command_count == before
+        assert np.all(arx_service.controller.get_gain().kp() == 0)
+        assert arx_service.controller.get_gain().gripper_kp > 0
+        # Operator movement is measured; no policy command is needed.
+        arx_service.controller.state.pos()[0] += 0.2
+        moved = operator.get_state()
+        assert moved.mode == "drag"
+        restored = operator.resume_hold(moved.control_epoch)
+        np.testing.assert_allclose(
+            arx_service.controller.get_joint_cmd().pos(), moved.arm_joint_position
+        )
+        np.testing.assert_allclose(restored.tcp_pose, moved.tcp_pose)
+        assert restored.mode == "hold"
+        with pytest.raises(Arx5Error, match="mode"):
+            arm.command_pose(
+                restored.tcp_pose, restored.gripper_width, restored.control_epoch
+            )
+        active = arm.enable_policy(restored.control_epoch)
+        arm.command_pose(active.tcp_pose, active.gripper_width, active.control_epoch)
+        history = arm.get_state_history(since=policy.timestamp)
+        assert {s.mode for s in history} >= {"policy", "drag", "hold"}
+        assert all(
+            a.timestamp <= b.timestamp and a.sequence < b.sequence
+            for a, b in zip(history, history[1:])
+        )
+    finally:
+        operator.disconnect()
+        arm.disconnect()
+
+
+@pytest.mark.parametrize(
+    "failure", ["ik", "joint_limit", "translation", "rotation", "gripper", "expired"]
+)
+def test_arx_rejected_command_never_reaches_sdk(arx_service, failure):
+    from rlinf.robotics.parts.arms import Arx5Arm
+    from rlinf.robotics.parts.arms.arx5_protocol import Arx5Error
+
+    arm = Arx5Arm(arx_service.endpoint)
+    arm.connect()
+    try:
+        hold = arm.resume_hold()
+        state = arm.enable_policy(hold.control_epoch)
+        target, width, deadline = state.tcp_pose.copy(), state.gripper_width, None
+        if failure == "ik":
+            arx_service.solver.status = -5
+        elif failure == "joint_limit":
+            arx_service.solver.target_offset[0] = 4
+        elif failure == "translation":
+            target[0] += 0.1
+        elif failure == "rotation":
+            target[3:] = R.from_euler("z", 0.4).as_quat()
+        elif failure == "gripper":
+            width = 0.086
+        else:
+            arx_service.solver.delay = 0.03
+            deadline = time.monotonic() + 0.01
+        count = arx_service.controller.command_count
+        with pytest.raises(Arx5Error):
+            arm.command_pose(target, width, state.control_epoch, deadline=deadline)
+        assert arx_service.controller.command_count == count
+        assert arm.get_state().mode == "policy"
+    finally:
+        arm.disconnect()
+
+
+def test_arx_watchdog_holds_and_requires_new_epoch(arx_service):
+    from rlinf.robotics.parts.arms import Arx5Arm
+    from rlinf.robotics.parts.arms.arx5_protocol import Arx5Error
+
+    arm = Arx5Arm(arx_service.endpoint)
+    arm.connect()
+    try:
+        hold = arm.resume_hold()
+        policy = arm.enable_policy(hold.control_epoch)
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            latest = arm.get_state()
+            if latest.mode == "hold":
+                break
+            time.sleep(0.01)
+        assert latest.mode == "hold"
+        assert latest.control_epoch > policy.control_epoch
+        with pytest.raises(Arx5Error, match="stale_epoch"):
+            arm.command_pose(
+                policy.tcp_pose, policy.gripper_width, policy.control_epoch
+            )
+    finally:
+        arm.disconnect()
+
+
+def test_arx_stale_feedback_fault_is_latched(arx_service):
+    from rlinf.robotics.parts.arms import Arx5Arm
+    from rlinf.robotics.parts.arms.arx5_protocol import Arx5Error
+
+    arm = Arx5Arm(arx_service.endpoint)
+    arm.connect()
+    try:
+        arx_service.controller.feedback_age = 1.0
+        with pytest.raises(Arx5Error, match="stale_state"):
+            arm.get_state()
+        arx_service.controller.feedback_age = 0
+        recovered_feedback = arm.get_state()
+        assert recovered_feedback.mode == "fault"
+        with pytest.raises(Arx5Error, match="fault"):
+            arm.resume_hold()
+        assert arx_service.controller.command_count == 0
+    finally:
+        arm.disconnect()
+
+
+def test_arx_rpc_timeout_and_malformed_json_are_bounded(arx_service, tmp_path):
+    import zmq
+
+    from rlinf.robotics.parts.arms.arx5_protocol import Arx5Client, Arx5Error
+
+    absent = Arx5Client(f"ipc://{tmp_path / 'absent.sock'}", timeout_ms=20)
+    start = time.monotonic()
+    with pytest.raises(Arx5Error, match="timeout"):
+        absent.request("state")
+    assert time.monotonic() - start < 0.5
+    absent.close()
+    absent.close()
+    with pytest.raises(Arx5Error, match="closed"):
+        absent.request("state")
+    context = zmq.Context()
+    socket = context.socket(zmq.REQ)
+    socket.setsockopt(zmq.RCVTIMEO, 500)
+    try:
+        socket.connect(arx_service.endpoint)
+        socket.send(b"not JSON")
+        response = socket.recv_json()
+        assert response["error"]["code"] == "protocol"
+        socket.send_json(
+            {"version": 99, "request_id": "bad", "deadline": time.monotonic() + 1}
+        )
+        assert socket.recv_json()["ok"] is False
+    finally:
+        socket.close(linger=0)
+        context.term()
+    client = Arx5Client(arx_service.endpoint)
+    try:
+        assert client.request("state")["mode"] == "disabled"
+    finally:
+        client.close()
+
+
+def test_arx_sdk_frame_and_gripper_calibration_roundtrip():
+    from robot_mocks.arx5 import FakeArxController, FakeArxSDK, FakeArxSolver
+
+    from rlinf.robotics.parts.arms.arx5_protocol import (
+        SdkArx5Adapter,
+        matrix_pose,
+        pose_matrix,
+    )
+
+    controller, solver = FakeArxController(), FakeArxSolver()
+    controller.state.pos()[3:] = [0.2, -0.4, 0.7]
+    transform = np.eye(4)
+    transform[:3, :3] = np.array([[0, 0, 1], [-1, 0, 0], [0, -1, 0]])
+    transform[:3, 3] = [0.01, -0.02, 0.14]
+    adapter = SdkArx5Adapter(
+        FakeArxSDK,
+        controller,
+        solver,
+        eef_to_tcp=transform,
+        gripper_scale=0.5,
+        gripper_offset=0.01,
+    )
+    state = adapter.read_state()
+    expected = np.eye(4)
+    expected[:3, :3] = R.from_euler("xyz", controller.state.pos()[3:]).as_matrix()
+    expected[:3, 3] = controller.state.pos()[:3]
+    np.testing.assert_allclose(
+        pose_matrix(state["tcp_pose"]), expected @ transform, atol=1e-12
+    )
+    assert state["gripper_width"] == pytest.approx(0.06)
+    adapter.resume_hold()
+    adapter.command_pose(
+        state["tcp_pose"],
+        state["gripper_width"],
+        max_joint_step=0.1,
+        deadline=time.monotonic() + 1,
+    )
+    np.testing.assert_allclose(
+        controller.get_joint_cmd().pos(), [0.25, 0, 0.35, 0.2, -0.4, 0.7], atol=1e-12
+    )
+    assert controller.get_joint_cmd().gripper_pos == pytest.approx(0.04)
+    half_turn = np.eye(4)
+    half_turn[:3, :3] = R.from_euler("x", np.pi).as_matrix()
+    np.testing.assert_allclose(
+        pose_matrix(matrix_pose(half_turn)), half_turn, atol=1e-12
+    )
+
+
+def test_arx_sdk_drag_gain_failures_and_manual_gripper():
+    from robot_mocks.arx5 import FakeArxController, FakeArxSDK, FakeArxSolver
+
+    from rlinf.robotics.parts.arms.arx5_protocol import Arx5Error, SdkArx5Adapter
+
+    controller = FakeArxController()
+    adapter = SdkArx5Adapter(
+        FakeArxSDK, controller, FakeArxSolver(), drag_gripper="manual"
+    )
+    adapter.resume_hold()
+    adapter.enter_drag()
+    assert controller.get_gain().gripper_kp == 0
+    assert controller.get_gain().gripper_kd == 0
+    controller.ignore_gain = True
+    with pytest.raises(Arx5Error, match="gain change"):
+        adapter.resume_hold()
+    controller.ignore_gain = False
+    controller.config.gravity_compensation = False
+    with pytest.raises(Arx5Error, match="gravity_compensation"):
+        adapter.enter_drag()
+
+
+def test_arx_service_restart_and_read_only_mode_reject_motion():
+    from robot_mocks.arx5 import FakeArxController, FakeArxSDK, FakeArxSolver
+
+    from rlinf.robotics.parts.arms.arx5_protocol import Arx5Service, SdkArx5Adapter
+
+    controller = FakeArxController()
+    service = Arx5Service(SdkArx5Adapter(FakeArxSDK, controller, FakeArxSolver()))
+    request = {
+        "version": 1,
+        "request_id": "id",
+        "operation": "resume_hold",
+        "expected_epoch": 0,
+        "deadline": time.monotonic() + 1,
+        "server_id": "old-service",
+    }
+    assert service.handle(request)["error"]["code"] == "session"
+    request["server_id"] = service.server_id
+    assert service.handle(request)["error"]["code"] == "disabled"
+    assert controller.command_count == 0
+
+
+def test_arx_cli_operator_process_uses_the_same_service(arx_service):
+    import json
+
+    interpreter = os.environ.get("ARX_SDK_PYTHON", sys.executable)
+    command = [
+        interpreter,
+        str(_ROOT / "toolkits/realworld_check/arx5_server.py"),
+        "--endpoint",
+        arx_service.endpoint,
+        "--operation",
+    ]
+    result = subprocess.run(
+        command + ["state"], capture_output=True, text=True, timeout=10, check=True
+    )
+    assert json.loads(result.stdout)["mode"] == "disabled"
+    result = subprocess.run(
+        command + ["resume_hold"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    )
+    assert json.loads(result.stdout)["mode"] == "hold"
+    result = subprocess.run(
+        command + ["enter_drag"], capture_output=True, text=True, timeout=10, check=True
+    )
+    assert json.loads(result.stdout)["mode"] == "drag"
+    assert arx_service.service.mode == "drag"
+
+
+def test_arx_history_keeps_sampling_without_policy_requests(arx_service):
+    from rlinf.robotics.parts.arms import Arx5Arm
+
+    arm = Arx5Arm(arx_service.endpoint)
+    arm.connect()
+    try:
+        first = arm.get_state()
+        arx_service.controller.state.pos()[0] += 0.1
+        time.sleep(0.04)
+        history = arm.get_state_history(since=first.timestamp)
+        assert len(history) >= 3
+        assert history[-1].arm_joint_position[0] == pytest.approx(
+            first.arm_joint_position[0] + 0.1
+        )
+        assert all(s.mode == "disabled" for s in history)
+        assert arx_service.controller.command_count == 0
+    finally:
+        arm.disconnect()
+
+
+def test_arx_sdk_command_failure_latches_fault_and_does_not_ack(arx_service):
+    from rlinf.robotics.parts.arms import Arx5Arm
+    from rlinf.robotics.parts.arms.arx5_protocol import Arx5Error
+
+    arm = Arx5Arm(arx_service.endpoint)
+    arm.connect()
+    try:
+        held = arm.resume_hold()
+        state = arm.enable_policy(held.control_epoch)
+        arx_service.controller.fail_command = True
+        with pytest.raises(Arx5Error, match="sdk"):
+            arm.command_pose(state.tcp_pose, state.gripper_width, state.control_epoch)
+        arx_service.controller.fail_command = False
+        current = arm.get_state()
+        assert current.mode == "fault"
+        assert current.control_epoch > state.control_epoch
+        with pytest.raises(Arx5Error, match="fault"):
+            arm.resume_hold()
+    finally:
+        arm.disconnect()
+
+
+def test_arx_client_does_not_adopt_a_restarted_service(arx_service):
+    from rlinf.robotics.parts.arms import Arx5Arm
+    from rlinf.robotics.parts.arms.arx5_protocol import Arx5Error
+
+    arm = Arx5Arm(arx_service.endpoint)
+    arm.connect()
+    try:
+        # Represent the process identity changing while its endpoint stays put.
+        arx_service.service.server_id = "replacement-service"
+        with pytest.raises(Arx5Error, match="restarted"):
+            arm.get_state()
+    finally:
+        arm.disconnect()
+    arm.connect()
+    try:
+        assert arm.get_state().server_id == "replacement-service"
+    finally:
+        arm.disconnect()
+
+
+def test_arx_quantized_sdk_ticks_do_not_duplicate_history_or_relabel_old_samples():
+    from robot_mocks.arx5 import FakeArxController, FakeArxSDK, FakeArxSolver
+
+    from rlinf.envs.real.arx5.history import interpolate_states
+    from rlinf.robotics.parts.arms.arx5 import Arx5RobotState
+    from rlinf.robotics.parts.arms.arx5_protocol import (
+        Arx5Service,
+        MotionLimits,
+        SdkArx5Adapter,
+    )
+
+    controller = FakeArxController()
+    controller.feedback_period = 0.02
+    adapter = SdkArx5Adapter(FakeArxSDK, controller, FakeArxSolver())
+    readings = [adapter.read_state()["timestamp"] for _ in range(20)]
+    assert len(set(readings)) < len(readings), (
+        "test must read the same hardware tick twice"
+    )
+    assert all(a <= b for a, b in zip(readings, readings[1:]))
+    service = Arx5Service(
+        adapter, allow_motion=True, limits=MotionLimits(0.1, 0.2, 0.1, 0.3)
+    )
+
+    def call(operation, **payload):
+        response = service.handle(
+            {
+                "version": 1,
+                "request_id": "tick-test",
+                "operation": operation,
+                "server_id": service.server_id,
+                "deadline": time.monotonic() + 1,
+                **payload,
+            }
+        )
+        assert response["ok"], response
+        return response["result"]
+
+    disabled = call("state")
+    for _ in range(10):
+        call("state")
+    transition_started = time.monotonic()
+    hold = call("resume_hold", expected_epoch=disabled["control_epoch"])
+    assert hold["timestamp"] >= transition_started
+    assert hold["mode"] == "hold"
+    drag_started = time.monotonic()
+    drag = call("enter_drag", expected_epoch=hold["control_epoch"])
+    assert drag["timestamp"] >= drag_started
+    history = [Arx5RobotState.from_dict(s) for s in call("history")["states"]]
+    assert all(a.timestamp < b.timestamp for a, b in zip(history, history[1:]))
+    assert all(s.timestamp >= transition_started for s in history if s.mode == "hold")
+    assert all(s.timestamp >= drag_started for s in history if s.mode == "drag")
+    poses, _ = interpolate_states(
+        history, [history[-2].timestamp, history[-1].timestamp], max_gap=0.1
+    )
+    assert np.isfinite(poses).all()

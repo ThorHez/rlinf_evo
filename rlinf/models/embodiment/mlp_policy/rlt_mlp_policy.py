@@ -16,6 +16,10 @@ import torch
 import torch.nn.functional as F
 from torch.distributions.normal import Normal
 
+from rlinf.algorithms.rlt.torch_action_codec import (
+    parameterize_eef_residual,
+    validate_eef_action_config,
+)
 from rlinf.models.embodiment.mlp_policy.mlp_policy import MLPPolicy
 
 
@@ -24,7 +28,10 @@ class RLTMLPPolicy(MLPPolicy):
 
     Actor input follows RLT: reference action chunk, RL token feature, and
     proprioceptive state. Critic input follows RLT: action chunk, RL token
-    feature, and proprioceptive state.
+    feature, and proprioceptive state. The opt-in ``eef_rot6d`` mode predicts
+    a reference residual in normalized XYZ, row rotation, and metric width;
+    returned log probabilities describe the latent Gaussian, not its SO(3)
+    projection (the RLT objective does not use an entropy term).
     """
 
     def __init__(
@@ -37,6 +44,10 @@ class RLTMLPPolicy(MLPPolicy):
         add_q_head: bool = True,
         q_head_type: str = "default",
         fixed_std: float = 0.002,
+        action_parameterization: str = "tanh",
+        gripper_width_min: float = 0.0,
+        gripper_width_max: float | None = None,
+        eef_residual_scale: tuple[float, ...] | None = None,
     ):
         if not add_q_head:
             raise ValueError(
@@ -74,6 +85,24 @@ class RLTMLPPolicy(MLPPolicy):
         self.chunk_len = chunk_len
         self.ref_chunk_len = ref_chunk_len
         self.flat_action_dim = flat_action_dim
+        self.action_parameterization = action_parameterization
+        if action_parameterization not in ("tanh", "eef_rot6d"):
+            raise ValueError(
+                f"Unknown action parameterization: {action_parameterization!r}."
+            )
+        if action_parameterization == "eef_rot6d":
+            scale = validate_eef_action_config(
+                step_action_dim,
+                gripper_width_min,
+                gripper_width_max,
+                eef_residual_scale,
+            )
+            self.gripper_width_min = float(gripper_width_min)
+            self.gripper_width_max = float(gripper_width_max)
+            self.register_buffer("eef_residual_scale", scale)
+            # Start from Stage 1 rather than an arbitrary orientation or width.
+            torch.nn.init.zeros_(self.actor_mean.weight)
+            torch.nn.init.zeros_(self.actor_mean.bias)
         self.fixed_std = float(fixed_std)
         if self.fixed_std <= 0:
             raise ValueError(f"fixed_std must be positive, got {self.fixed_std}.")
@@ -135,6 +164,19 @@ class RLTMLPPolicy(MLPPolicy):
     def _format_chunk_actions(self, actions: torch.Tensor) -> torch.Tensor:
         return actions.reshape(-1, self.chunk_len, self.step_action_dim)
 
+    def _parameterize_actions(self, values: torch.Tensor, obs: dict) -> torch.Tensor:
+        if self.action_parameterization == "tanh":
+            return torch.tanh(values)
+        chunk = self._format_chunk_actions(values)
+        reference = self._format_chunk_actions(self._get_ref_chunk(obs))
+        return parameterize_eef_residual(
+            chunk,
+            reference,
+            self.eef_residual_scale,
+            self.gripper_width_min,
+            self.gripper_width_max,
+        ).reshape(values.shape)
+
     def sac_forward(
         self,
         obs,
@@ -154,7 +196,7 @@ class RLTMLPPolicy(MLPPolicy):
         probs = Normal(action_mean, action_std)
         action = action_mean if deterministic else probs.rsample()
         chunk_logprobs = probs.log_prob(action)
-        action = torch.tanh(action)
+        action = self._parameterize_actions(action, obs)
         return action, chunk_logprobs, None
 
     def sac_q_forward(self, obs, actions, shared_feature=None, detach_encoder=False):
@@ -201,6 +243,8 @@ class RLTMLPPolicy(MLPPolicy):
         )
         actor_state = self._actor_state(obs)
         pred_actions = self.actor_mean(self.backbone(actor_state))
+        if self.action_parameterization == "eef_rot6d":
+            pred_actions = self._parameterize_actions(pred_actions, obs)
         return F.mse_loss(pred_actions, target_actions, reduction="none")
 
     @torch.inference_mode()
@@ -221,6 +265,12 @@ class RLTMLPPolicy(MLPPolicy):
         chunk_actions = self._format_chunk_actions(action)
 
         forward_inputs = {"action": action, "model_action": action}
+        if self.action_parameterization == "eef_rot6d":
+            # Human correction is the BC target, never the actor's reference
+            # input; otherwise a residual actor can copy that target directly.
+            forward_inputs["preserve_rlt_reference"] = torch.ones(
+                action.shape[0], 1, dtype=torch.bool, device=action.device
+            )
         if return_obs:
             forward_inputs.update(obs)
 

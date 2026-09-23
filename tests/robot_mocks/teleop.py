@@ -217,6 +217,9 @@ def keyboard() -> types.ModuleType:
             self.name = "fake keyboard"
             self.path = path
             self.closed = False
+            self._next_event = 0.0
+            self._key_index = 0
+            self._pressed = False
 
         def capabilities(self, verbose: bool = False) -> dict[int, list[int]]:
             # Every key the listener requires, so it accepts this as a keyboard.
@@ -242,6 +245,31 @@ def keyboard() -> types.ModuleType:
                     time.sleep(dwell)
                     yield types.SimpleNamespace(type=codes.EV_KEY, code=code, value=0)
                     time.sleep(0.02)
+
+        def read(self):
+            """Expose evdev's nonblocking read contract to the real listener."""
+            keys = [
+                by_name[name.strip().lower()]
+                for name in os.environ.get("RLINF_FAKE_KEYS", "").split(",")
+                if name.strip().lower() in by_name
+            ]
+            now = time.monotonic()
+            if self.closed or not keys or now < self._next_event:
+                raise BlockingIOError()
+            event = types.SimpleNamespace(
+                type=codes.EV_KEY,
+                code=keys[self._key_index % len(keys)],
+                value=0 if self._pressed else 1,
+            )
+            if self._pressed:
+                self._key_index += 1
+                self._next_event = now + 0.02
+            else:
+                self._next_event = now + float(
+                    os.environ.get("RLINF_FAKE_KEY_DWELL", "0.3")
+                )
+            self._pressed = not self._pressed
+            return [event]
 
         def close(self) -> None:
             self.closed = True

@@ -66,6 +66,7 @@ class EnvWorker(Worker):
 
         self.last_obs_list = []
         self.last_intervened_info_list = []
+        self.last_rlt_switch_flags = []
         self._prefetched_train_bootstrap: list[EnvOutput] | None = None
         self._trajectory_step = 0
         self._component_placement = HybridComponentPlacement(cfg, Cluster())
@@ -372,9 +373,10 @@ class EnvWorker(Worker):
         for i in range(self.stage_num):
             if self.enable_train:
                 if self.cfg.env.train.auto_reset:
-                    extracted_obs, _ = self.env_list[i].reset()
+                    extracted_obs, infos = self.env_list[i].reset()
                     self.last_obs_list.append(extracted_obs)
                     self.last_intervened_info_list.append((None, None))
+                    self.last_rlt_switch_flags.append(self._rlt_flags_from_infos(infos))
                 if self.train_enable_offload and self.cfg.env.train.get(
                     "enable_init_offload", True
                 ):
@@ -457,9 +459,7 @@ class EnvWorker(Worker):
             infos["intervene_action"] if "intervene_action" in infos else None
         )
         intervene_flags = infos["intervene_flag"] if "intervene_flag" in infos else None
-        rlt_switch_flags = (
-            infos["rlt_switch_flags"] if "rlt_switch_flags" in infos else None
-        )
+        rlt_switch_flags = self._rlt_flags_from_infos(infos)
         if self.cfg.env.train.auto_reset and chunk_dones.any():
             if "intervene_action" in infos["final_info"]:
                 intervene_actions = infos["final_info"]["intervene_action"]
@@ -477,6 +477,16 @@ class EnvWorker(Worker):
                 intervene_actions=intervene_actions,
                 intervene_flags=intervene_flags,
                 rlt_switch_flags=rlt_switch_flags,
+                executed_actions=(
+                    infos.get("final_info", infos)
+                    if self.cfg.env.train.auto_reset and chunk_dones.any()
+                    else infos
+                ).get("executed_actions"),
+                transition_valid=(
+                    infos.get("final_info", infos)
+                    if self.cfg.env.train.auto_reset and chunk_dones.any()
+                    else infos
+                ).get("transition_valid"),
             ),
         )
         chunk_step_payload = {
@@ -541,9 +551,7 @@ class EnvWorker(Worker):
                 for key in infos["episode"]:
                     env_info[key] = infos["episode"][key][newly_done].cpu()
 
-        rlt_switch_flags = (
-            infos["rlt_switch_flags"] if "rlt_switch_flags" in infos else None
-        )
+        rlt_switch_flags = self._rlt_flags_from_infos(infos)
 
         env_output = EnvOutput(
             obs=extracted_obs,
@@ -742,6 +750,11 @@ class EnvWorker(Worker):
         )
         return sparse_rewards
 
+    @staticmethod
+    def _rlt_flags_from_infos(infos: dict[str, Any]) -> torch.Tensor | None:
+        flags = infos.get("rlt_switch_flags")
+        return torch.as_tensor(flags, dtype=torch.bool) if flags is not None else None
+
     @Worker.timer("env/bootstrap_step")
     def bootstrap_step(self) -> list[EnvOutput]:
         def get_zero_dones() -> torch.Tensor:
@@ -766,6 +779,7 @@ class EnvWorker(Worker):
                         dones=dones,
                         terminations=terminations,
                         truncations=truncations,
+                        rlt_switch_flags=self._rlt_flags_from_infos(infos),
                     ),
                     final_obs=(
                         infos["final_observation"]
@@ -789,6 +803,9 @@ class EnvWorker(Worker):
                         truncations=truncations,
                         intervene_actions=self.last_intervened_info_list[stage_id][0],
                         intervene_flags=self.last_intervened_info_list[stage_id][1],
+                        rlt_switch_flags=getattr(
+                            self, "last_rlt_switch_flags", [None] * self.stage_num
+                        )[stage_id],
                     ),
                 )
                 env_outputs.append(env_output)
@@ -1067,6 +1084,9 @@ class EnvWorker(Worker):
             (env_output.intervene_actions, env_output.intervene_flags)
             for env_output in env_output_list
         ]
+        self.last_rlt_switch_flags = [
+            output.rlt_switch_flags for output in env_output_list
+        ]
 
     @staticmethod
     def _infer_action_batch_size(actions: torch.Tensor) -> int:
@@ -1225,6 +1245,9 @@ class EnvWorker(Worker):
                     extracted_obs, infos = self.eval_env_list[stage_id].reset()
                     env_output = EnvOutput(
                         obs=extracted_obs,
+                        transition=EnvTransition(
+                            rlt_switch_flags=self._rlt_flags_from_infos(infos),
+                        ),
                         final_obs=(
                             infos["final_observation"]
                             if "final_observation" in infos

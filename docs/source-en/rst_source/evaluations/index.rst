@@ -69,6 +69,8 @@ End-to-end evaluation workflows per benchmark (setup → config → launch → r
      - Workflow
    * - :doc:`RealWorld <guides/realworld>`
      - Franka real-robot evaluation and deployment.
+   * - :doc:`ARX RL Token <../examples/embodied/arx5_rlt>`
+     - Fixed-weight RL Token execution with the same ARX observations and drag controls.
    * - :doc:`BEHAVIOR-1K <guides/behavior>`
      - BEHAVIOR-1K evaluation.
    * - :doc:`LIBERO <guides/libero>`

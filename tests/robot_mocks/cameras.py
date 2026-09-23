@@ -21,7 +21,10 @@ capture-thread output.
 from __future__ import annotations
 
 import importlib.machinery
+import time
 import types
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -318,3 +321,73 @@ def modules(**_: Any) -> dict[str, types.ModuleType]:
     made = {"pyrealsense2": realsense(), "cv2": opencv()}
     made.update(zed())
     return made
+
+
+@dataclass
+class UVCCaptureFactory:
+    """Picklable capture device for exercising the real spawn/process boundary."""
+
+    log_path: str
+    failure: str = ""
+
+    def __call__(self, path: str, backend: int) -> "UVCCapture":
+        return UVCCapture(self.log_path, self.failure, path, backend)
+
+
+class UVCCapture:
+    """V4L2 stand-in with explicit failures and a monotonic synthetic frame."""
+
+    def __init__(self, log_path: str, failure: str, path: str, backend: int):
+        self.log_path = Path(log_path)
+        self.failure = failure
+        self.properties: dict[int, float] = {}
+        self.count = 0
+        self._log(f"open:{path}:{backend}")
+        if failure == "open_hang":
+            time.sleep(60)
+
+    def _log(self, text: str) -> None:
+        with self.log_path.open("a") as stream:
+            stream.write(text + "\n")
+
+    def isOpened(self) -> bool:
+        return self.failure != "open"
+
+    def set(self, prop: int, value: float) -> bool:
+        self.properties[prop] = value
+        return True
+
+    def get(self, prop: int) -> float:
+        import cv2
+
+        bad_prop = {
+            "format": cv2.CAP_PROP_FOURCC,
+            "resolution": cv2.CAP_PROP_FRAME_WIDTH,
+            "fps": cv2.CAP_PROP_FPS,
+        }.get(self.failure)
+        return self.properties[prop] + (1 if prop == bad_prop else 0)
+
+    def read(self) -> tuple[bool, Any]:
+        import cv2
+
+        if self.failure == "read_hang" or (self.failure == "one_frame" and self.count):
+            self._log("read_hang")
+            time.sleep(60)
+        if self.failure == "read":
+            return False, None
+        time.sleep(1 / self.properties[cv2.CAP_PROP_FPS])
+        self.count += 1
+        shape = (
+            int(self.properties[cv2.CAP_PROP_FRAME_HEIGHT]),
+            int(self.properties[cv2.CAP_PROP_FRAME_WIDTH]),
+            3,
+        )
+        if self.failure == "shape":
+            shape = (*shape[:2], 4)
+        frame = np.full(shape, self.count % 255, dtype=np.uint8)
+        return True, frame
+
+    def release(self) -> None:
+        self._log("release")
+        if self.failure == "close_hang":
+            time.sleep(60)

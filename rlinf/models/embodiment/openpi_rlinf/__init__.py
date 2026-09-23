@@ -267,7 +267,12 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
             and bool(OmegaConf.select(model_cfg, "use_rlt", default=False)),
         )
     elif safetensors_path is not None:
-        load_base_safetensors(model, safetensors_path)
+        load_base_safetensors(
+            model,
+            safetensors_path,
+            expect_rlt=task == "eval"
+            and bool(OmegaConf.select(model_cfg, "use_rlt", default=False)),
+        )
 
     _freeze_after_load(model, task)
     _apply_openpi_param_dtypes(model, target_dtype)

@@ -35,6 +35,10 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
             add_q_head=cfg.get("add_q_head", True),
             q_head_type=cfg.get("q_head_type", "default"),
             fixed_std=cfg.get("fixed_std", 0.002),
+            action_parameterization=cfg.get("action_parameterization", "tanh"),
+            gripper_width_min=cfg.get("gripper_width_min", 0.0),
+            gripper_width_max=cfg.get("gripper_width_max", None),
+            eef_residual_scale=cfg.get("eef_residual_scale", None),
         )
     elif cfg.model_type == "rlt_td3_mlp_policy":
         model = RLTTD3MLPPolicy(
@@ -51,6 +55,10 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
             mlp_num_hidden_layers=cfg.get("mlp_num_hidden_layers", 2),
             actor_noise_sigma=cfg.get("actor_noise_sigma", 0.1),
             ref_action_dropout=cfg.get("ref_action_dropout", 0.0),
+            action_parameterization=cfg.get("action_parameterization", "clamp"),
+            gripper_width_min=cfg.get("gripper_width_min", 0.0),
+            gripper_width_max=cfg.get("gripper_width_max", None),
+            eef_residual_scale=cfg.get("eef_residual_scale", None),
         )
     elif iql_config is not None:
         model = IQLMLPPolicy(

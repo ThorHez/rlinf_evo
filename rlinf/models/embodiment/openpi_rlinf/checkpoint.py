@@ -189,15 +189,27 @@ def load_full_weights(model, weights_path, *, expect_rlt: bool) -> None:
         logger.info("openpi_rlinf: loaded full checkpoint from %s", weights_path)
 
 
-def load_base_safetensors(model, safetensors_path) -> None:
-    """Load a base checkpoint, accepting new and legacy OpenPI layouts."""
+def load_base_safetensors(model, safetensors_path, *, expect_rlt: bool = False) -> None:
+    """Load safetensors; require a complete RLT module for Stage 2 inference."""
     import safetensors.torch
 
     state_dict = _convert_official_openpi_keys(
         safetensors.torch.load_file(str(safetensors_path), device="cpu"),
         safetensors_path,
     )
+    if expect_rlt and not any(key.startswith("rlt_module.") for key in state_dict):
+        raise ValueError(
+            "openpi_rlinf RLT checkpoint has no rlt_module.* weights. "
+            "Stage2 must consume a Stage1 checkpoint trained with openpi.use_rlt=True."
+        )
     incompatible = model.load_state_dict(state_dict, strict=False)
+    if expect_rlt and any(
+        key.startswith("rlt_module.") for key in incompatible.missing_keys
+    ):
+        raise RuntimeError(
+            f"RLT checkpoint {safetensors_path} did not load all rlt_module weights; "
+            f"missing={incompatible.missing_keys[:8]}"
+        )
     unexpected = list(incompatible.unexpected_keys)
     if unexpected:
         raise RuntimeError(

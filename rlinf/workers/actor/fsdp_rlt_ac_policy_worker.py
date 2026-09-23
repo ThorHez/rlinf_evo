@@ -113,13 +113,22 @@ class RLTACLossMixin:
                 pi_chunk.shape[:2], dtype=torch.bool, device=pi_chunk.device
             )
         else:
-            human_mask = (
-                self._flatten_chunk(intervene_flags)
-                .to(device=pi_chunk.device)
-                .bool()
-                .reshape(-1, chunk_len, action_dim)
-                .any(dim=-1)
+            flags = (
+                self._flatten_chunk(intervene_flags).to(device=pi_chunk.device).bool()
             )
+            batch_size = pi_chunk.shape[0]
+            if flags.shape == (batch_size, chunk_len):
+                human_mask = flags
+            elif flags.shape == (batch_size, chunk_len * action_dim):
+                human_mask = flags.reshape(batch_size, chunk_len, action_dim).any(
+                    dim=-1
+                )
+            else:
+                raise ValueError(
+                    "RLT intervention flags must have one value per step or "
+                    f"action dimension, got {tuple(intervene_flags.shape)} for "
+                    f"actions {(batch_size, chunk_len, action_dim)}."
+                )
 
         bc_target = torch.where(human_mask[..., None], action_chunk, bc_ref_chunk)
         bc_error = torch.mean(torch.square(pi_chunk - bc_target), dim=-1)
@@ -610,6 +619,54 @@ class RLTACReplayMixin:
         recv_list: list[Trajectory],
     ) -> tuple[int, int]:
         self._last_replay_metrics = {}
+
+        if self.cfg.algorithm.replay_buffer.get("filter_invalid_transitions", False):
+            valid_trajectories = []
+            for trajectory in recv_list:
+                flat = self.replay_buffer._flatten_trajectory(trajectory)
+                # Value bootstrap rows follow each rollout epoch; unlike done
+                # boundaries they are at the end, and are not action samples.
+                if trajectory.prev_values is not None:
+                    value_rows = trajectory.prev_values
+                    traj_len = int(trajectory.rewards.shape[0])
+                    extra = int(value_rows.shape[0] - traj_len)
+                    if extra > 0:
+                        if traj_len % extra:
+                            raise ValueError(
+                                "Cannot align bootstrap values with replay actions."
+                            )
+                        value_rows = value_rows.reshape(
+                            extra, traj_len // extra + 1, *value_rows.shape[1:]
+                        )[:, :-1]
+                        flat["prev_values"] = value_rows.reshape(
+                            -1, *trajectory.prev_values.shape[2:]
+                        )
+                valid = flat.get("forward_inputs", {}).get("transition_valid")
+                if not isinstance(valid, torch.Tensor):
+                    raise ValueError(
+                        "This replay configuration requires environment transition_valid flags."
+                    )
+                keep = valid.bool().reshape(valid.shape[0], -1).all(dim=-1)
+                if not keep.any():
+                    continue
+                selected = Trajectory(
+                    max_episode_length=1, model_weights_id=trajectory.model_weights_id
+                )
+                for name in selected.__dataclass_fields__:
+                    value = flat.get(name)
+                    if isinstance(value, torch.Tensor):
+                        setattr(selected, name, value[keep].unsqueeze(1).contiguous())
+                    elif isinstance(value, dict):
+                        setattr(
+                            selected,
+                            name,
+                            {
+                                key: item[keep].unsqueeze(1).contiguous()
+                                for key, item in value.items()
+                            },
+                        )
+                valid_trajectories.append(selected)
+            recv_list = valid_trajectories
 
         if use_simulator_transition_replay(self.cfg):
             replay_list = []

@@ -1,0 +1,23 @@
+# Fixed TD3 weights with the same evaluation controls as the AC variant.
+defaults:
+- realworld_arx5_rlt_stage2_td3_mlp
+- _self_
+runner:
+  task_type: embodied_eval
+  only_eval: true
+  max_epochs: 1
+  val_check_interval: 1
+  save_interval: -1
+  resume_dir: null
+  ckpt_path: ${oc.env:RLT_STAGE2_WEIGHTS}
+  logger:
+    experiment_name: realworld_arx5_rlt_stage2_td3_eval
+env:
+  eval:
+    override_cfg:
+      start_with_actor: true
+    video_cfg:
+      save_video: false
+rollout:
+  collect_transitions: false
+  model: ${actor.model}

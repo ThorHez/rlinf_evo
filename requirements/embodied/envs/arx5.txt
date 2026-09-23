@@ -1,0 +1,7 @@
+# Python 3.11 RLinf client; the vendor SDK stays in its separate Python 3.10 service.
+numpy
+scipy
+gymnasium
+pyzmq>=25
+opencv-python>=4.8
+evdev

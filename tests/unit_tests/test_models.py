@@ -1731,9 +1731,15 @@ _fake_gym.Env = _FakeGymEnv
 _fake_gym.Wrapper = _FakeGymWrapper
 
 if "gymnasium" not in sys.modules:
-    sys.modules["gymnasium"] = _fake_gym
+    if importlib.util.find_spec("gymnasium") is None:
+        sys.modules["gymnasium"] = _fake_gym
+    else:
+        importlib.import_module("gymnasium")
 if "imageio" not in sys.modules:
-    sys.modules["imageio"] = MagicMock()
+    if importlib.util.find_spec("imageio") is None:
+        sys.modules["imageio"] = MagicMock()
+    else:
+        importlib.import_module("imageio")
 
 
 def _delayed_env(delay: float):
@@ -1804,3 +1810,568 @@ def test_delay_metrics_report_every_sample():
 
     assert metrics.tolist() == pytest.approx([0.03, 0.03])
     assert env.insert_delay_metrics().numel() == 0
+
+
+def _eef_rlt_obs(batch=3, horizon=2):
+    from scipy.spatial.transform import Rotation
+
+    rotations = Rotation.from_euler("xyz", [[0.3, -0.4, 0.8], [-0.7, 0.2, 0.5]])
+    reference = torch.tensor(
+        np.c_[
+            [[1.7, -1.4, 0.05], [0.8, 0.3, -0.02]],
+            rotations.as_matrix()[:, :2].reshape(2, 6),
+            [0.03, 0.07],
+        ],
+        dtype=torch.float32,
+    )
+    return {
+        "z_rl": torch.randn(batch, 4),
+        "proprio": torch.randn(batch, 32),
+        "ref_chunk": reference[:horizon].unsqueeze(0).expand(batch, -1, -1).clone(),
+    }
+
+
+def _eef_rlt_policy(model_type="rlt_mlp_policy", **overrides):
+    from rlinf.models.embodiment.mlp_policy import get_model
+
+    return get_model(
+        OmegaConf.create(
+            {
+                "model_type": model_type,
+                "z_dim": 4,
+                "proprio_dim": 32,
+                "action_dim": 10,
+                "num_action_chunks": 2,
+                "action_parameterization": "eef_rot6d",
+                "gripper_width_max": 0.085,
+                **overrides,
+            }
+        )
+    )
+
+
+@pytest.mark.parametrize("model_type", ["rlt_mlp_policy", "rlt_td3_mlp_policy"])
+def test_eef_rlt_actor_preserves_reference_domain_and_eval_is_deterministic(
+    model_type,
+):
+    policy = _eef_rlt_policy(model_type)
+    obs = _eef_rlt_obs()
+    first, result = policy.predict_action_batch(obs, mode="eval")
+    second, _ = policy.predict_action_batch(obs, mode="eval")
+    torch.testing.assert_close(first, obs["ref_chunk"], atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(first, second, atol=0, rtol=0)
+    assert first[..., :3].abs().max() > 1.0
+    assert torch.all((first[..., 9] >= 0.0) & (first[..., 9] <= 0.085))
+    assert result["forward_inputs"]["preserve_rlt_reference"].dtype == torch.bool
+    assert result["forward_inputs"]["preserve_rlt_reference"].all()
+    sampled, _ = policy.predict_action_batch(obs, mode="train")
+    assert not torch.equal(sampled, first)
+    rows = sampled[..., 3:9].reshape(3, 2, 2, 3)
+    torch.testing.assert_close(
+        rows @ rows.transpose(-1, -2),
+        torch.eye(2).expand(3, 2, 2, 2),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+@pytest.mark.parametrize("model_type", ["rlt_mlp_policy", "rlt_td3_mlp_policy"])
+def test_eef_rlt_gripper_bounds_and_reference_dropout_preserve_action_contract(
+    model_type,
+):
+    policy = _eef_rlt_policy(model_type, gripper_width_min=0.005)
+    obs = _eef_rlt_obs()
+    obs["ref_chunk"][:, 0, 9] = -0.3
+    obs["ref_chunk"][:, 1, 9] = 0.4
+    actions, _, _ = policy.sac_forward(
+        obs,
+        deterministic=True,
+        apply_reference_dropout=True,
+        reference_dropout_prob=1.0,
+    )
+    expected = obs["ref_chunk"].clone()
+    expected[..., 9] = expected[..., 9].clamp(0.005, 0.085)
+    torch.testing.assert_close(actions.reshape_as(expected), expected)
+
+
+@pytest.mark.parametrize("model_type", ["rlt_mlp_policy", "rlt_td3_mlp_policy"])
+def test_eef_rlt_exploration_noise_uses_per_dimension_scales_and_has_gradients(
+    model_type,
+):
+    torch.manual_seed(142)
+    policy = _eef_rlt_policy(model_type, fixed_std=0.1, actor_noise_sigma=0.1)
+    obs = _eef_rlt_obs(batch=512)
+    actions, _, _ = policy.sac_forward(obs, deterministic=False)
+    chunks = actions.reshape_as(obs["ref_chunk"])
+    residual = chunks - obs["ref_chunk"]
+    # Both policies draw latent sigma=0.1 noise: XYZ std=.01, width std=.0005 m.
+    assert residual[..., 0].std().item() == pytest.approx(0.01, rel=0.15)
+    assert residual[..., 9].std().item() == pytest.approx(0.0005, rel=0.15)
+    target = obs["ref_chunk"].flatten(1) + torch.linspace(-0.2, 0.2, 20)
+    (actions - target).square().mean().backward()
+    grads = [p.grad for p in policy.parameters() if p.grad is not None]
+    assert grads and all(torch.isfinite(grad).all() for grad in grads)
+    assert sum(grad.abs().sum() for grad in grads) > 0
+    optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
+    optimizer.step()
+    updated, _ = policy.predict_action_batch(obs, mode="eval")
+    for action_slice in (slice(0, 3), slice(3, 9), slice(9, 10)):
+        assert not torch.equal(
+            updated[..., action_slice], obs["ref_chunk"][..., action_slice]
+        )
+
+
+def test_eef_projection_has_finite_batched_gradients_and_handles_degenerate_rows():
+    from rlinf.algorithms.rlt.torch_action_codec import project_eef_actions
+
+    actions = _eef_rlt_obs()["ref_chunk"].double().requires_grad_()
+    assert torch.autograd.gradcheck(
+        project_eef_actions, (actions,), eps=1e-6, atol=1e-5
+    )
+    degenerate = torch.zeros(4, 2, 10, requires_grad=True)
+    result = project_eef_actions(degenerate)
+    torch.testing.assert_close(
+        result[..., 3:9], torch.tensor([1, 0, 0, 0, 1, 0.0]).expand(4, 2, 6)
+    )
+    result.sum().backward()
+    assert torch.isfinite(degenerate.grad).all()
+
+
+def test_eef_rlt_actor_and_critic_update_with_human_bc_targets():
+    from rlinf.workers.actor.fsdp_rlt_ac_policy_worker import RLTACLossMixin
+
+    policy = _eef_rlt_policy()
+    obs = _eef_rlt_obs()
+    worker = SimpleNamespace(
+        _flatten_chunk=RLTACLossMixin._flatten_chunk,
+        _chunk_shape=lambda: (2, 10),
+    )
+    human_actions = obs["ref_chunk"].clone()
+    human_actions[:, 0, 0] += 0.3
+    human_actions[:, 0, 9] = 0.01
+    human_flags = torch.zeros_like(human_actions, dtype=torch.bool)
+    human_flags[:, 0] = True
+    optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
+    before, _ = policy.predict_action_batch(obs, mode="eval")
+    q_before = policy.sac_q_forward(obs, human_actions).detach().clone()
+    for _ in range(3):
+        optimizer.zero_grad()
+        pi, _, _ = policy.sac_forward(obs, deterministic=True)
+        bc, metrics = RLTACLossMixin._bc_metrics(
+            worker, pi, human_actions, obs["ref_chunk"], human_flags
+        )
+        q = policy.sac_q_forward(obs, human_actions)
+        loss = (
+            bc + (q - 0.7).square().mean() - 0.01 * policy.sac_q_forward(obs, pi).mean()
+        )
+        assert torch.isfinite(loss)
+        loss.backward()
+        assert all(
+            torch.isfinite(p.grad).all()
+            for p in policy.parameters()
+            if p.grad is not None
+        )
+        assert policy.actor_mean.weight.grad.abs().sum() > 0
+        optimizer.step()
+    after, _ = policy.predict_action_batch(obs, mode="eval")
+    assert metrics["human_mask_ratio"] == 0.5
+    assert not torch.equal(after, before)
+    assert not torch.equal(policy.sac_q_forward(obs, human_actions), q_before)
+    sft_loss = policy.sft_forward({"obs": obs, "actions": human_actions})
+    assert torch.isfinite(sft_loss).all() and sft_loss.requires_grad
+
+
+@pytest.mark.parametrize("model_type", ["rlt_mlp_policy", "rlt_td3_mlp_policy"])
+def test_eef_rlt_parameterization_is_opt_in_and_validated(model_type):
+    from rlinf.models.embodiment.mlp_policy.rlt_mlp_policy import RLTMLPPolicy
+    from rlinf.models.embodiment.mlp_policy.rlt_td3_mlp_policy import RLTTD3MLPPolicy
+
+    policy_type = RLTMLPPolicy if model_type == "rlt_mlp_policy" else RLTTD3MLPPolicy
+    args = {"z_dim": 4, "proprio_dim": 32, "action_dim": 10, "num_action_chunks": 2}
+    legacy = policy_type(**args)
+    obs = _eef_rlt_obs()
+    actual, _, _ = legacy.sac_forward(obs, deterministic=True)
+    if model_type == "rlt_mlp_policy":
+        expected = torch.tanh(
+            legacy.actor_mean(
+                legacy.backbone(
+                    torch.cat(
+                        (obs["ref_chunk"].flatten(1), obs["z_rl"], obs["proprio"]),
+                        dim=-1,
+                    )
+                )
+            )
+        )
+    else:
+        expected = legacy.actor.mlp(
+            torch.cat((obs["z_rl"], obs["proprio"], obs["ref_chunk"].flatten(1)), -1)
+        ).clamp(-1.0, 1.0)
+    torch.testing.assert_close(actual, expected)
+    assert "eef_residual_scale" not in legacy.state_dict()
+    _, result = legacy.predict_action_batch(obs, mode="eval")
+    assert "preserve_rlt_reference" not in result["forward_inputs"]
+    with pytest.raises(ValueError, match="calibrated"):
+        policy_type(**args, action_parameterization="eef_rot6d")
+    with pytest.raises(ValueError, match="action_dim=10"):
+        policy_type(
+            **{**args, "action_dim": 7},
+            action_parameterization="eef_rot6d",
+            gripper_width_max=0.085,
+        )
+    for scale in ([0.1] * 9, [0.1] * 9 + [0.0], [0.1] * 9 + [float("nan")]):
+        with pytest.raises(ValueError, match="ten finite positive"):
+            _eef_rlt_policy(model_type, eef_residual_scale=scale)
+    with pytest.raises(ValueError, match="Unknown action parameterization"):
+        _eef_rlt_policy(model_type, action_parameterization="unknown")
+
+
+def test_arx_repack_uses_explicit_history_fields_and_latest_rgb():
+    from rlinf.models.embodiment.openpi.policies.umi_policy import (
+        UmiV4Inputs,
+        UmiV4ModelInputs,
+        UmiV4Normalize,
+    )
+    from rlinf.models.embodiment.openpi_rlinf.transforms.apply import (
+        apply_input_transform,
+    )
+    from rlinf.models.embodiment.openpi_rlinf.transforms.env import repack_env_obs
+
+    batch = 2
+    fields = {
+        "robot0_eef_pos": torch.arange(batch * 6).reshape(batch, 2, 3).float() / 10,
+        "robot0_eef_rot_axis_angle": torch.tensor([1, 0, 0, 0, 1, 0.0]).expand(
+            batch, 2, 6
+        ),
+        "robot0_eef_rot_axis_angle_wrt_start": torch.tensor(
+            [0, -1, 0, 1, 0, 0.0]
+        ).expand(batch, 2, 6),
+        "robot0_gripper_width": torch.full((batch, 2, 1), 0.04),
+        "left_wrist_0_rgb_1": torch.full((batch, 224, 224, 3), 37, dtype=torch.uint8),
+        "task_descriptions": ["pick", "place"],
+        "states": torch.zeros(batch, 32),
+    }
+    repacked = repack_env_obs("pi05_umi_v4", fields, select_state=lambda x: x)
+    assert repacked["left_wrist_0_rgb_1"] is fields["left_wrist_0_rgb_1"]
+    normalizer = UmiV4Normalize({"state": (np.r_[2, 3, 4, np.ones(13)], np.zeros(16))})
+
+    def transform(sample):
+        sample = UmiV4ModelInputs()(normalizer(UmiV4Inputs()(sample)))
+        sample.pop("prompt")
+        return sample
+
+    actual = apply_input_transform(transform, repacked)
+    expected = torch.cat(
+        [
+            fields[key]
+            for key in (
+                "robot0_eef_pos",
+                "robot0_eef_rot_axis_angle",
+                "robot0_eef_rot_axis_angle_wrt_start",
+                "robot0_gripper_width",
+            )
+        ],
+        -1,
+    ).clone()
+    expected[..., :3] *= torch.tensor([2, 3, 4])
+    torch.testing.assert_close(actual["state"], expected.reshape(batch, 32))
+    torch.testing.assert_close(
+        actual["image"]["left_wrist_0_rgb"], fields["left_wrist_0_rgb_1"]
+    )
+    assert not actual["image_mask"]["base_0_rgb"].any()
+    assert actual["image_mask"]["left_wrist_0_rgb"].all()
+    missing = dict(fields)
+    missing.pop("robot0_eef_pos")
+    with pytest.raises(ValueError, match="missing model fields"):
+        repack_env_obs("pi05_umi_v4", missing, select_state=lambda x: x)
+
+
+def test_arx_rlt_feature_extraction_keeps_normalized_reference_and_proprio(monkeypatch):
+    from rlinf.algorithms.rlt.torch_action_codec import project_eef_actions
+    from rlinf.models.embodiment.openpi_rlinf.tasks import eval as eval_task
+
+    normalized_state = torch.linspace(-2, 2, 64).reshape(2, 32)
+    model_actions = torch.randn(2, 16, 32)
+    model_actions[..., 9] = 0.04
+    observation = SimpleNamespace(state=normalized_state, tokenized_prompt=None)
+    prefix = torch.ones(2, 3, 4)
+    prefix_mask = torch.ones(2, 3, dtype=torch.bool)
+    fake_model = SimpleNamespace(
+        config_name="pi05_umi_v4",
+        action_chunk=16,
+        _require_rlt=lambda: None,
+        env_obs_to_observation=lambda obs: observation,
+        build_prefix_cache=lambda obs: (prefix, prefix_mask, None),
+        _select_rlt_prefix_embeddings=lambda output, mask, prompt: (output, mask),
+        _encode_rlt_flat=lambda output, mask: torch.ones(2, 4),
+        _sample_actions_from_prefix_cache=lambda *args: model_actions,
+        _select_configured_state=lambda states: states,
+    )
+    monkeypatch.setattr(eval_task, "preprocess_observation", lambda obs, train: obs)
+    actual = eval_task.Pi0Eval.extract_rlt_obs(
+        fake_model, {"states": torch.full((2, 32), 77.0)}
+    )
+    torch.testing.assert_close(actual["proprio"], normalized_state)
+    torch.testing.assert_close(
+        actual["ref_chunk"], project_eef_actions(model_actions[..., :10])
+    )
+    torch.testing.assert_close(actual["ref_chunk"][..., :3], model_actions[..., :3])
+    torch.testing.assert_close(actual["ref_chunk"][..., 9], model_actions[..., 9])
+    assert actual["ref_chunk"].shape == (2, 16, 10)
+
+
+@pytest.mark.parametrize("model_type", ["rlt_mlp_policy", "rlt_td3_mlp_policy"])
+def test_eef_rlt_factory_wires_action_domain_and_checkpoint_roundtrip(model_type):
+    from rlinf.models.embodiment.mlp_policy import get_model
+
+    config = OmegaConf.create(
+        {
+            "model_type": model_type,
+            "z_dim": 4,
+            "proprio_dim": 32,
+            "action_dim": 10,
+            "num_action_chunks": 2,
+            "action_parameterization": "eef_rot6d",
+            "gripper_width_min": 0.005,
+            "gripper_width_max": 0.085,
+            "eef_residual_scale": [0.2] * 9 + [0.003],
+        }
+    )
+    source, restored = get_model(config), get_model(config)
+    optimizer = torch.optim.Adam(source.parameters(), lr=1e-3)
+    obs = _eef_rlt_obs()
+    predicted, _, _ = source.sac_forward(obs, deterministic=True)
+    (predicted[:, 0] - 0.4).square().mean().backward()
+    optimizer.step()
+    restored.load_state_dict(source.state_dict())
+    torch.testing.assert_close(
+        source.state_dict()["eef_residual_scale"],
+        torch.tensor([0.2] * 9 + [0.003]),
+    )
+    actual, _ = restored.predict_action_batch(obs, mode="eval")
+    expected, _ = source.predict_action_batch(obs, mode="eval")
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    config.gripper_width_max = float("inf")
+    with pytest.raises(ValueError, match="calibrated"):
+        get_model(config)
+
+
+def test_arx_stage1_eval_requires_complete_rlt_safetensors_but_sft_can_initialize(
+    tmp_path, monkeypatch
+):
+    from safetensors.torch import save_file
+
+    from rlinf.models.embodiment import openpi_rlinf
+
+    config = OmegaConf.create(
+        {
+            "model_path": str(tmp_path),
+            "precision": "fp32",
+            "pi05": True,
+            "action_dim": 4,
+            "num_action_chunks": 3,
+            "num_steps": 1,
+            "openpi": {
+                "task": "sft",
+                "config_name": "pi05_umi_v4",
+                "model_action_dim": 4,
+                "action_horizon": 3,
+                "max_token_len": 2,
+                "paligemma_variant": "dummy",
+                "action_expert_variant": "dummy",
+                "use_rlt": True,
+                "rlt_input_dim": 64,
+                "rlt_embed_dim": 16,
+                "rlt_prefix_seq_len": 16,
+                "rlt_num_layers": 1,
+                "rlt_num_heads": 2,
+                "rlt_image_only": False,
+                "rlt_use_mask": True,
+            },
+        }
+    )
+    from rlinf.models.embodiment.openpi_rlinf.pi0 import Pi0
+    from rlinf.models.embodiment.openpi_rlinf.pi0_config import Pi0Config
+
+    base = Pi0(
+        Pi0Config(
+            dtype="float32",
+            pi05=True,
+            action_dim=4,
+            action_horizon=3,
+            max_token_len=2,
+            paligemma_variant="dummy",
+            action_expert_variant="dummy",
+        )
+    )
+    path = tmp_path / "model.safetensors"
+    save_file(base.state_dict(), path)
+    # Tokenizer assets are unrelated to the checkpoint guard under test.
+    monkeypatch.setattr(openpi_rlinf, "_install_transforms", lambda *args: None)
+    stage1 = openpi_rlinf.get_model(config)
+    trained = {key: value.clone() for key, value in stage1.state_dict().items()}
+    assert any(key.startswith("rlt_module.") for key in trained)
+    config.openpi.task = "eval"
+    with pytest.raises(ValueError, match="no rlt_module"):
+        openpi_rlinf.get_model(config)
+    partial = dict(trained)
+    partial.pop(next(key for key in partial if key.startswith("rlt_module.")))
+    save_file(partial, path)
+    with pytest.raises(RuntimeError, match="all rlt_module weights"):
+        openpi_rlinf.get_model(config)
+    save_file(trained, path)
+    loaded = openpi_rlinf.get_model(config)
+    for key, value in trained.items():
+        torch.testing.assert_close(loaded.state_dict()[key], value, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("model_type", ["rlt_mlp_policy", "rlt_td3_mlp_policy"])
+def test_arx_stage2_eval_loads_saved_actor_file_in_rollout_startup(
+    tmp_path, monkeypatch, model_type
+):
+    from rlinf.models.embodiment.mlp_policy import get_model as build_actor
+    from rlinf.workers.rollout.hf import huggingface_worker
+
+    config = OmegaConf.create(
+        {
+            "model_type": model_type,
+            "precision": "fp32",
+            "is_lora": False,
+            "z_dim": 4,
+            "proprio_dim": 32,
+            "action_dim": 10,
+            "num_action_chunks": 16,
+            "ref_num_action_chunks": 16,
+            "model_path": None,
+            "action_parameterization": "eef_rot6d",
+            "gripper_width_max": 0.085,
+        }
+    )
+    actor = build_actor(config)
+    obs = _eef_rlt_obs()
+    obs["ref_chunk"] = obs["ref_chunk"].repeat(1, 8, 1)
+    optimizer = torch.optim.Adam(actor.parameters(), lr=1e-3)
+    pi, _, _ = actor.sac_forward(obs, deterministic=True)
+    (pi[:, 0] - 0.3).square().mean().backward()
+    optimizer.step()
+    weights = tmp_path / "actor" / "model_state_dict" / "full_weights.pt"
+    weights.parent.mkdir(parents=True)
+    from torch.distributed.checkpoint.state_dict import (
+        StateDictOptions,
+        get_model_state_dict,
+    )
+
+    # The FSDP strategy exports full_weights.pt through this public API.
+    exported = get_model_state_dict(
+        actor, options=StateDictOptions(full_state_dict=True, cpu_offload=True)
+    )
+    torch.save(exported, weights)
+    cfg = OmegaConf.create(
+        {
+            "runner": {"ckpt_path": str(weights)},
+            "rollout": {
+                "model": config,
+                "rlt_feature_model": {"model_type": "feature"},
+            },
+        }
+    )
+    feature = torch.nn.Linear(2, 2)
+    monkeypatch.setattr(
+        huggingface_worker,
+        "get_model",
+        lambda model_cfg: (
+            feature if model_cfg.model_type == "feature" else build_actor(model_cfg)
+        ),
+    )
+    monkeypatch.setattr(huggingface_worker, "build_rlt_route", lambda cfg: "realworld")
+    worker = SimpleNamespace(
+        cfg=cfg,
+        model_cfg=config,
+        enable_opd=False,
+        expert_model=None,
+        enable_cuda_graph=False,
+        enable_offload=False,
+        setup_sample_params=lambda: None,
+    )
+    # Exercise the actual deployment load path, not just load_state_dict alone.
+    huggingface_worker.MultiStepRolloutWorker.init_worker(worker)
+    expected, _ = actor.predict_action_batch(obs, mode="eval")
+    actual, _ = worker.hf_model.predict_action_batch(obs, mode="eval")
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert actual.shape == (3, 16, 10)
+    assert not worker.rlt_feature_model.training
+    assert all(
+        not parameter.requires_grad
+        for parameter in worker.rlt_feature_model.parameters()
+    )
+
+
+def test_arx_stage1_pipeline_reads_the_explicit_environment_norm_stats(
+    tmp_path, monkeypatch
+):
+    import json
+
+    from openpi import transforms
+    from openpi.models import tokenizer
+
+    from rlinf.algorithms.rlt.action_codec import EEFActionCodec
+    from rlinf.models.embodiment.openpi_rlinf.transforms.pipeline import (
+        build_openpi_transforms,
+    )
+
+    stats = {
+        key: {
+            "min": [-0.4, -0.1, 0.03] + [-8.0] * (dim - 3),
+            "max": [0.6, 0.3, 0.03] + [8.0] * (dim - 3),
+            "q01": [-0.2] * dim,
+            "q99": [0.2] * dim,
+        }
+        for key, dim in (("state", 16), ("actions", 10))
+    }
+    stats_dir = tmp_path / "original-training-assets"
+    stats_dir.mkdir()
+    stats_path = stats_dir / "norm_stats.json"
+    stats_path.write_text(json.dumps({"norm_stats": stats}))
+    codec = EEFActionCodec.from_stats_json(stats_path)
+
+    class OfflineTokenizer:
+        def __init__(self, max_len):
+            self.max_len = max_len
+
+        def tokenize(self, prompt, state=None):
+            assert state.shape == (2, 16)
+            return np.zeros(self.max_len, dtype=np.int32), np.ones(
+                self.max_len, dtype=bool
+            )
+
+    monkeypatch.setattr(tokenizer, "PaligemmaTokenizer", OfflineTokenizer)
+    input_transforms, output_transforms = build_openpi_transforms(
+        str(tmp_path / "different-checkpoint-assets"),
+        "pi05_umi_v4",
+        data_kwargs={"norm_stats_path": str(stats_path)},
+    )
+    fields = codec.encode_observation(
+        np.array([[0.2, 0.3, 0.4, 0, 0, 0, 1.0], [0.3, 0.5, 0.6, 0, 0, 0, 1.0]]),
+        np.array([0.02, 0.06]),
+        np.array([0.1, 0.2, 0.3, 0, 0, 0, 1.0]),
+    )
+    actions = np.tile([0.2, 0.05, -0.01, 1, 0, 0, 0, 1, 0, 0.04], (16, 1))
+    processed = transforms.compose(input_transforms)(
+        {
+            **fields,
+            "actions": actions,
+            "prompt": "pick",
+            "left_wrist_0_rgb_1": np.zeros((224, 224, 3), dtype=np.uint8),
+        }
+    )
+    np.testing.assert_allclose(
+        processed["state"], codec.flatten_observation(fields, normalize=True), atol=1e-7
+    )
+    np.testing.assert_allclose(
+        processed["actions"][..., :10], codec.normalize_action(actions), atol=1e-7
+    )
+    assert processed["actions"].shape == (16, 32)
+    assert np.count_nonzero(processed["actions"][..., 10:]) == 0
+    decoded = transforms.compose(output_transforms)(
+        {"actions": processed["actions"], "state": processed["state"]}
+    )
+    np.testing.assert_allclose(decoded["actions"], actions, atol=1e-7)

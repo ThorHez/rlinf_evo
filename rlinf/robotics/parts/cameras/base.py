@@ -76,6 +76,7 @@ class CameraInfo:
     fps: int = 15
     enable_depth: bool = False
     crop_region: Optional[tuple[float, float, float, float]] = None
+    pixel_format: str = "MJPG"  # UVC FOURCC; other backends keep their native format.
 
 
 class BaseCamera(Camera, ABC):
@@ -87,7 +88,9 @@ class BaseCamera(Camera, ABC):
         self._frame_capturing_thread: Optional[threading.Thread] = None
         self._frame_capturing_start = False
         self._depth_scale = 1.0
-        self._latest_frame: Optional[tuple[float, np.ndarray]] = None
+        self._latest_frame: Optional[tuple[float, np.ndarray, int]] = None
+        self._frame_sequence = 0
+        self._capture_stop = threading.Event()
 
     @property
     def name(self) -> str:
@@ -133,8 +136,9 @@ class BaseCamera(Camera, ABC):
             return
         self._frame_queue = queue.Queue()
         self._latest_frame = None
+        self._capture_stop = threading.Event()
         self._frame_capturing_thread = threading.Thread(
-            target=self._capture_frames, daemon=True
+            target=self._capture_frames, args=(self._capture_stop,), daemon=True
         )
         self._frame_capturing_start = True
         self._frame_capturing_thread.start()
@@ -142,6 +146,7 @@ class BaseCamera(Camera, ABC):
     def _closing(self) -> None:
         """Stop capturing, while the camera is still open to be read."""
         self._frame_capturing_start = False
+        self._capture_stop.set()
         thread = self._frame_capturing_thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=2.0)
@@ -219,6 +224,29 @@ class BaseCamera(Camera, ABC):
         Raises:
             queue.Empty: If no attempt produced a frame.
         """
+        return self.get_frame_with_timestamp(
+            timeout=timeout, attempts=attempts, wait=wait, max_age=max_age
+        )[1]
+
+    def get_frame_with_timestamp(
+        self,
+        timeout: float = 5,
+        attempts: int = 1,
+        wait: float = 0.0,
+        *,
+        max_age: Optional[float] = None,
+    ) -> tuple[float, np.ndarray, int]:
+        """Return ``(received_at, frame, sequence)`` using the host monotonic clock.
+
+        The timestamp records completion of the device read, not sensor exposure.
+        Sequence numbers increase across reconnects; reconnecting clears cached
+        frames. Reusing a recent frame preserves its timestamp and sequence and
+        returns an independent array. Read/retry arguments match :meth:`get_frame`.
+        """
+        if not np.isfinite(timeout) or timeout < 0:
+            raise ValueError("timeout must be finite and nonnegative.")
+        if not np.isfinite(wait) or wait < 0:
+            raise ValueError("wait must be finite and nonnegative.")
         assert self._frame_capturing_start, (
             "Frame capturing is not started. Call connect() first."
         )
@@ -233,16 +261,16 @@ class BaseCamera(Camera, ABC):
                 and latest is not None
                 and time.monotonic() - latest[0] <= max_age
             ):
-                return latest[1].copy()
+                return latest[0], latest[1].copy(), latest[2]
         for attempt in range(1, max(attempts, 1) + 1):
             try:
                 deadline = time.monotonic() + timeout
                 while True:
-                    captured_at, frame = self._frame_queue.get(
+                    captured_at, frame, sequence = self._frame_queue.get(
                         timeout=max(0.0, deadline - time.monotonic())
                     )
                     if max_age is None or time.monotonic() - captured_at <= max_age:
-                        return frame
+                        return captured_at, frame, sequence
             except queue.Empty:
                 get_logger().warning(
                     "Camera %s produced no frame within %.2fs "
@@ -262,11 +290,10 @@ class BaseCamera(Camera, ABC):
 
     # Internal capture loop
 
-    def _capture_frames(self) -> None:
-        while self._frame_capturing_start:
-            time.sleep(1 / self._camera_info.fps)
+    def _capture_frames(self, stop: threading.Event) -> None:
+        while not stop.wait(1 / self._camera_info.fps):
             try:
-                has_frame, frame = self._read_frame()
+                has_frame, frame, captured_at = self._read_frame_with_timestamp()
             except Exception as e:
                 _logger.error(
                     "[%s] _read_frame raised %s: %s; stopping capture thread.",
@@ -275,20 +302,30 @@ class BaseCamera(Camera, ABC):
                     e,
                 )
                 break
-            if not has_frame:
+            if not has_frame or frame is None:
                 _logger.error(
                     "[%s] _read_frame returned (False, None); stopping capture thread.",
                     self._camera_info.name,
                 )
                 break
-            captured_at = time.monotonic()
-            self._latest_frame = (captured_at, frame.copy())
+            if stop.is_set():
+                break
+            self._frame_sequence += 1
+            sequence = self._frame_sequence
+            self._latest_frame = (captured_at, frame.copy(), sequence)
             if not self._frame_queue.empty():
                 try:
                     self._frame_queue.get_nowait()
                 except queue.Empty:
                     pass
-            self._frame_queue.put((captured_at, frame))
+            self._frame_queue.put((captured_at, frame, sequence))
+
+    def _read_frame_with_timestamp(
+        self,
+    ) -> tuple[bool, Optional[np.ndarray], float]:
+        """Read a frame and record its host receipt time."""
+        success, frame = self._read_frame()
+        return success, frame, time.monotonic()
 
     @abstractmethod
     def _open(self) -> Any:

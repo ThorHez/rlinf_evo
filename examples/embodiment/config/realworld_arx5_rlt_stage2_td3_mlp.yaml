@@ -1,0 +1,26 @@
+# Existing RLT TD3 variant with the same ARX hardware and EEF contract as AC.
+defaults:
+- realworld_arx5_rlt_stage2_ac_mlp
+- _self_
+runner:
+  logger:
+    experiment_name: realworld_arx5_rlt_stage2_td3_mlp
+algorithm:
+  adv_type: rlt_td3
+  loss_type: rlt_td3
+  actor_agg_q: min
+  q_weight: 1.0
+  bc_weight: 1.0
+  actor_update_action_noise: true
+  critic_actor_ratio: 2
+actor:
+  model:
+    model_type: rlt_td3_mlp_policy
+    mlp_hidden_dim: 256
+    mlp_num_hidden_layers: 2
+    # Noise is sampled in residual coordinates, before eef_residual_scale.
+    actor_noise_sigma: 0.1
+  optim:
+    lr: 1e-4
+  critic_optim:
+    lr: 1e-4

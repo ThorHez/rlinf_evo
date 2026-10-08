@@ -21,6 +21,7 @@ import logging
 # limitations under the License.
 import os
 import pickle
+import random
 import sys
 import tempfile
 import time
@@ -31,8 +32,10 @@ from types import ModuleType, SimpleNamespace
 from unittest import mock
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 import ray
+import torch
 from omegaconf import OmegaConf
 
 import rlinf.scheduler.hardware.accelerators.nvidia_gpu as nv_module
@@ -868,3 +871,304 @@ def test_clear_stub_import_preserves_real_flash_attn_module():
     Patcher.clear_stub_import("flash_attn")
 
     assert sys.modules["flash_attn"] is real_flash_attn
+
+
+class _SftValidationModel(torch.nn.Module):
+    """Small numerical model for the worker's reduction and RNG contract."""
+
+    def __init__(self):
+        super().__init__()
+        self.scale = torch.nn.Parameter(torch.ones(()))
+        self.frozen_branch = torch.nn.Dropout()
+        self.fail = False
+
+    def forward(self, *, data, **kwargs):
+        assert kwargs["evaluation"] is True
+        assert not self.training and not torch.is_grad_enabled()
+        random_probe = torch.rand(()) + np.random.random() + random.random()
+        if self.fail:
+            raise RuntimeError("validation model failure")
+        values = data["values"] * self.scale
+        tokens = data["tokens"]
+        vla = values.square().mean()
+        rlt = tokens.square().mean()
+        return {
+            "sample_count": values.new_tensor(values.numel()),
+            "rlt_valid_elements": values.new_tensor(tokens.numel()),
+            "loss": rlt + 2 * vla,
+            "vla_loss": vla,
+            "rlt_loss": rlt,
+            "rlt_shuffle_loss": rlt + 1,
+            "action_mse": vla,
+            "action_mae": values.abs().mean(),
+            "random_probe": random_probe,
+        }
+
+
+def _sft_validation_worker(monkeypatch):
+    from contextlib import nullcontext
+
+    from rlinf.workers.sft.fsdp_vla_sft_worker import FSDPVlaSftWorker
+
+    monkeypatch.setattr(
+        Worker, "torch_platform", SimpleNamespace(is_available=lambda: False)
+    )
+    worker = object.__new__(FSDPVlaSftWorker)
+    worker.cfg = OmegaConf.create(
+        {
+            "actor": {
+                "model": {"model_type": "openpi_rlinf", "openpi": {"rlt_alpha": 2.0}}
+            },
+            "data": {"eval_seed": 712, "val_num_batches": None},
+        }
+    )
+    worker._world_size = 1
+    worker._rank = 0
+    worker.model = _SftValidationModel()
+    worker.model.frozen_branch.eval()
+    worker.eval_data_loader = [
+        {"values": torch.tensor([1.0, 3.0]), "tokens": torch.tensor([2.0])},
+        {"values": torch.tensor([5.0]), "tokens": torch.tensor([4.0, 6.0, 8.0])},
+    ]
+    worker.worker_timer = nullcontext
+    worker.amp_context = nullcontext()
+    return worker
+
+
+def test_openpi_sft_worker_validation_weights_and_restores_rng(monkeypatch):
+    from rlinf.utils.utils import get_rng_state, set_rng_state
+
+    worker = _sft_validation_worker(monkeypatch)
+    rng_state = get_rng_state()
+    expected_random = (random.random(), np.random.random(), torch.rand(3))
+    set_rng_state(rng_state)
+    first = worker.run_eval()
+    actual_random = (random.random(), np.random.random(), torch.rand(3))
+    assert actual_random[:2] == expected_random[:2]
+    torch.testing.assert_close(actual_random[2], expected_random[2], rtol=0, atol=0)
+    assert worker.model.training
+    assert not worker.model.frozen_branch.training
+    second = worker.run_eval()
+    assert first == second
+    assert first["samples"] == 3
+    assert first["vla_loss"] == pytest.approx(35 / 3)
+    assert first["rlt_loss"] == pytest.approx(30)
+    assert first["rlt_shuffle_loss"] == pytest.approx(31)
+    assert first["loss"] == pytest.approx(30 + 2 * 35 / 3)
+    assert first["rlt_shuffle_ratio"] == pytest.approx(31 / 30)
+    assert worker.model.scale.grad is None
+
+
+def test_openpi_sft_worker_validation_restores_after_failure(monkeypatch):
+    from rlinf.utils.utils import get_rng_state, set_rng_state
+
+    worker = _sft_validation_worker(monkeypatch)
+    worker.model.fail = True
+    rng_state = get_rng_state()
+    expected_random = (random.random(), np.random.random(), torch.rand(3))
+    set_rng_state(rng_state)
+    with pytest.raises(RuntimeError, match="validation model failure"):
+        worker.run_eval()
+    actual_random = (random.random(), np.random.random(), torch.rand(3))
+    assert actual_random[:2] == expected_random[:2]
+    torch.testing.assert_close(actual_random[2], expected_random[2], rtol=0, atol=0)
+    assert worker.model.training
+    assert not worker.model.frozen_branch.training
+
+
+def test_openpi_sft_worker_validation_limit_and_finite_metrics(monkeypatch):
+    worker = _sft_validation_worker(monkeypatch)
+    worker.cfg.data.val_num_batches = 1
+    output = worker.run_eval()
+    assert output["samples"] == 2
+    assert output["action_mse"] == 5
+    worker.eval_data_loader[0]["values"][0] = float("nan")
+    with pytest.raises(ValueError, match="nonfinite"):
+        worker.run_eval()
+    assert worker.model.training
+
+
+class _ActionProbeModel(torch.nn.Module):
+    """A small model boundary for the worker's extraction lifecycle."""
+
+    def __init__(self):
+        super().__init__()
+        self.scale = torch.nn.Parameter(torch.tensor(2.0))
+        self.frozen_branch = torch.nn.Linear(1, 1)
+        self.swap_calls = []
+
+    def forward(
+        self, *, data, feature_only, random_encoder, image_donor_observation, **kwargs
+    ):
+        assert feature_only and "actions" not in data
+        assert not self.training and not random_encoder.training
+        # Any model-side RNG consumption must remain invisible to training.
+        random.random()
+        np.random.random()
+        torch.rand(1)
+        values = data["state"][:, :4] * self.scale
+        random_value = random_encoder(
+            values[:, None], torch.ones((len(values), 1), dtype=torch.bool)
+        ).flatten(1)
+        self.swap_calls.append(image_donor_observation is not None)
+        return {
+            "z": values,
+            "z_random": random_value,
+            "z_image_swapped": values + (image_donor_observation is not None),
+        }
+
+
+def _action_probe_worker(monkeypatch, prepared):
+    from contextlib import nullcontext
+
+    from rlinf.workers.sft.fsdp_vla_sft_worker import FSDPVlaSftWorker
+
+    input_dir, cfg = prepared
+    monkeypatch.setattr(
+        Worker, "torch_platform", SimpleNamespace(is_available=lambda: False)
+    )
+    worker = object.__new__(FSDPVlaSftWorker)
+    worker.cfg = cfg.copy()
+    worker.cfg.actor.model.model_type = "openpi_rlinf"
+    worker.cfg.actor.model.openpi.update(
+        {
+            "use_rlt": True,
+            "rlt_input_dim": 4,
+            "rlt_embed_dim": 4,
+            "rlt_prefix_seq_len": 1,
+            "rlt_num_layers": 1,
+            "rlt_num_heads": 2,
+        }
+    )
+    worker.cfg.runner = {"action_probe": {"input_dir": str(input_dir), "batch_size": 3}}
+    worker._world_size = 1
+    worker._rank = 0
+    worker.model = _ActionProbeModel()
+    worker.model.frozen_branch.eval()
+    worker.model.scale.grad = torch.tensor(7.0)
+    worker.amp_context = nullcontext()
+    worker.data_iter = iter(["next training batch", "later training batch"])
+    return worker
+
+
+def test_openpi_sft_worker_action_probe_preserves_training_state(
+    monkeypatch, tmp_path, action_probe_prepared
+):
+    from rlinf.utils.utils import get_rng_state, set_rng_state
+
+    worker = _action_probe_worker(monkeypatch, action_probe_prepared)
+    state = get_rng_state()
+    expected = (random.random(), np.random.random(), torch.rand(3))
+    set_rng_state(state)
+    result = worker.extract_action_probe_features(str(tmp_path / "output"), 123)
+    actual = (random.random(), np.random.random(), torch.rand(3))
+    assert expected[:2] == actual[:2]
+    torch.testing.assert_close(expected[2], actual[2], rtol=0, atol=0)
+    assert worker.model.training and not worker.model.frozen_branch.training
+    assert next(worker.data_iter) == "next training batch"
+    assert worker.model.scale.grad.item() == 7
+    assert worker.model.scale.item() == 2
+    assert result["state"] == "completed" and result["global_step"] == 123
+    assert result["source_kind"] == "live_fsdp_model"
+    with np.load(tmp_path / "output/features.npz") as features:
+        assert len(features["z"]) == 8
+        np.testing.assert_array_equal(features["z"], features["state"][:, :4] * 2)
+        assert features["z_random"].shape == (8, 4)
+    assert worker.model.swap_calls == [False, True, True]
+    with pytest.raises(RuntimeError, match="initialization"):
+        worker.extract_action_probe_features(str(tmp_path / "output"), 124)
+
+
+def test_openpi_sft_worker_action_probe_restores_after_shard_write_failure(
+    monkeypatch, tmp_path, action_probe_prepared
+):
+    from rlinf.utils.utils import get_rng_state, set_rng_state
+
+    worker = _action_probe_worker(monkeypatch, action_probe_prepared)
+    state = get_rng_state()
+    expected = (random.random(), np.random.random(), torch.rand(3))
+    set_rng_state(state)
+
+    def disk_full(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(np, "savez", disk_full)
+    with pytest.raises(RuntimeError, match="shard writing"):
+        worker.extract_action_probe_features(str(tmp_path / "failed"), 123)
+    actual = (random.random(), np.random.random(), torch.rand(3))
+    assert actual[:2] == expected[:2]
+    torch.testing.assert_close(actual[2], expected[2], rtol=0, atol=0)
+    assert worker.model.training and not worker.model.frozen_branch.training
+    assert next(worker.data_iter) == "next training batch"
+    assert worker.model.scale.grad.item() == 7
+    assert not (tmp_path / "failed/features.npz").exists()
+    assert (
+        json.loads((tmp_path / "failed/extraction_status.json").read_text())["state"]
+        == "failed"
+    )
+
+
+def _distributed_action_probe_worker(rank, prepared, output, rendezvous, failed_rank):
+    import datetime
+
+    torch.set_num_threads(1)
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{rendezvous}",
+        rank=rank,
+        world_size=3,
+        timeout=datetime.timedelta(seconds=30),
+    )
+    try:
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            worker = _action_probe_worker(monkeypatch, prepared)
+            worker._rank = rank
+            worker._world_size = 3
+            worker.cfg.runner.action_probe.batch_size = 2
+            if rank == failed_rank:
+
+                def disk_full(*args, **kwargs):
+                    raise OSError("rank-local disk full")
+
+                monkeypatch.setattr(np, "savez", disk_full)
+            if failed_rank is None:
+                result = worker.extract_action_probe_features(str(output), 456)
+                assert result["state"] == "completed"
+                assert worker.model.swap_calls == [True, True]
+            else:
+                with pytest.raises(RuntimeError, match="shard writing"):
+                    worker.extract_action_probe_features(str(output), 456)
+            assert worker.model.training and not worker.model.frozen_branch.training
+            assert worker.model.scale.grad.item() == 7
+            assert next(worker.data_iter) == "next training batch"
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.parametrize("failed_rank", [None, 1])
+def test_openpi_sft_worker_action_probe_distributed_padding_and_failure(
+    tmp_path, action_probe_prepared, failed_rank
+):
+    if not torch.distributed.is_gloo_available():
+        pytest.skip("Distributed probe validation requires the Gloo backend.")
+    output = tmp_path / "distributed"
+    torch.multiprocessing.spawn(
+        _distributed_action_probe_worker,
+        args=(action_probe_prepared, output, tmp_path / "rendezvous", failed_rank),
+        nprocs=3,
+        join=True,
+    )
+    if failed_rank is None:
+        with np.load(output / "features.npz") as features:
+            assert features["z"].shape == (8, 4)
+            assert len(np.unique(features["dataset_global_index"])) == 8
+        assert (
+            json.loads((output / "extraction_status.json").read_text())["state"]
+            == "completed"
+        )
+    else:
+        assert not (output / "features.npz").exists()
+        assert (
+            json.loads((output / "extraction_status.json").read_text())["state"]
+            == "failed"
+        )

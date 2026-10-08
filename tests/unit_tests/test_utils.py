@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import math
 import os
 import subprocess
@@ -33,6 +34,152 @@ from omegaconf import OmegaConf
 from rlinf.algorithms.utils import compute_entropy_loss
 from rlinf.runners.reasoning_runner import ReasoningRunner
 from rlinf.utils.metric_utils import compute_evaluate_metrics, compute_rollout_metrics
+
+
+@pytest.mark.parametrize(
+    "mode,values", [("min", [4.0, 1.0, 3.0]), ("max", [1.0, 4.0, 2.0])]
+)
+def test_validation_checkpoint_selection_preserves_best_and_latest(
+    tmp_path, mode, values
+):
+    from rlinf.utils.checkpoint import ValidationCheckpointTracker
+
+    unrelated = tmp_path / "global_step_999" / "actor"
+    unrelated.mkdir(parents=True)
+    tracker = ValidationCheckpointTracker(
+        tmp_path, "action_mse", mode=mode, keep_last=1
+    )
+    for step, value in enumerate(values):
+        (tracker.path(step) / "actor").mkdir(parents=True)
+        tracker.record_saved(step, {"action_mse": value})
+    assert not tracker.path(0).exists()
+    assert tracker.path(1).is_dir() and tracker.path(2).is_dir()
+    assert unrelated.is_dir()
+    assert tracker.best_step == 1
+
+    resumed = ValidationCheckpointTracker(
+        tmp_path, "action_mse", mode=mode, keep_last=1
+    )
+    assert resumed.best_step == 1
+    assert resumed.best_value == values[1]
+    assert not resumed.improves({"action_mse": values[2]})
+    assert resumed.saved_steps == [1, 2]
+    with pytest.raises(ValueError, match="backward"):
+        resumed.record_saved(1, {"action_mse": values[1]})
+
+
+def test_validation_checkpoint_failed_save_cannot_prune_previous(tmp_path):
+    from rlinf.utils.checkpoint import ValidationCheckpointTracker
+
+    tracker = ValidationCheckpointTracker(tmp_path, "action_mse")
+    (tracker.path(0) / "actor").mkdir(parents=True)
+    tracker.record_saved(0, {"action_mse": 1.0})
+    assert tracker.improves({"action_mse": 0.5})
+    with pytest.raises(FileNotFoundError):
+        tracker.record_saved(1, {"action_mse": 0.5})
+    assert tracker.path(0).is_dir() and tracker.best_step == 0
+
+
+def test_validation_checkpoint_rejects_nonfinite_or_changed_metric(tmp_path):
+    from rlinf.utils.checkpoint import ValidationCheckpointTracker
+
+    tracker = ValidationCheckpointTracker(tmp_path, "action_mse")
+    for value in (float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="finite"):
+            tracker.improves({"action_mse": value})
+    with pytest.raises(KeyError):
+        tracker.improves({"rlt_loss": 0.1})
+    (tracker.path(0) / "actor").mkdir(parents=True)
+    tracker.record_saved(0, {"action_mse": 1.0})
+    with pytest.raises(ValueError, match="configuration"):
+        ValidationCheckpointTracker(tmp_path, "rlt_loss")
+
+
+def test_sft_runner_validates_before_updates_and_selects_checkpoint(tmp_path):
+    from rlinf.runners.sft_runner import SFTRunner
+
+    class Handle:
+        def __init__(self, value=None):
+            self.value = value
+
+        def wait(self):
+            return self.value
+
+        def consume_duration(self):
+            return 0.01
+
+    class ActorGroup:
+        """In-process boundary for the runner's remote actor group."""
+
+        def __init__(self):
+            self.updates = 0
+            self.validated_steps = []
+
+        def get_max_steps_per_epoch(self):
+            return Handle([10])
+
+        def run_eval(self):
+            self.validated_steps.append(self.updates)
+            return Handle([{"action_mse": [4.0, 2.0, 1.0, 3.0][self.updates]}])
+
+        def run_training(self):
+            self.updates += 1
+            return Handle([{"loss": 1.0}])
+
+        def save_checkpoint(self, path, step):
+            Path(path, "saved_step.txt").write_text(str(step))
+            return Handle()
+
+    cfg = OmegaConf.create(
+        {
+            "runner": {
+                "max_steps": 3,
+                "max_epochs": -1,
+                "val_check_interval": 1,
+                "save_interval": 1,
+                "eval_at_start": True,
+                "resume_dir": None,
+                "checkpoint_selection": {
+                    "metric": "action_mse",
+                    "mode": "min",
+                    "keep_last": 1,
+                },
+                "logger": {
+                    "log_path": str(tmp_path),
+                    "experiment_name": "holdout",
+                    "logger_backends": [],
+                },
+            }
+        }
+    )
+    actor = ActorGroup()
+    SFTRunner(cfg, actor).run()
+    assert actor.validated_steps == [0, 1, 2, 3]
+    output = tmp_path / "holdout"
+    history = [
+        json.loads(line)
+        for line in (output / "validation_metrics.jsonl").read_text().splitlines()
+    ]
+    assert [record["global_step"] for record in history] == [0, 1, 2, 3]
+    selection = json.loads(
+        (output / "checkpoints/validation_selection.json").read_text()
+    )
+    assert selection["best_step"] == 2 and selection["best_value"] == 1.0
+    assert selection["saved_steps"] == [2, 3]
+    assert sorted(
+        path.name for path in (output / "checkpoints").glob("global_step_*")
+    ) == ["global_step_2", "global_step_3"]
+    with pytest.raises(ValueError, match="fresh"):
+        SFTRunner(cfg, ActorGroup())
+    cfg.runner.resume_dir = str(output / "checkpoints/global_step_2")
+    with pytest.raises(ValueError, match="latest"):
+        SFTRunner(cfg, ActorGroup())
+    cfg.runner.resume_dir = str(tmp_path / "other/checkpoints/global_step_3")
+    with pytest.raises(ValueError, match="different run"):
+        SFTRunner(cfg, ActorGroup())
+    cfg.runner.resume_dir = str(output / "checkpoints/global_step_3")
+    resumed = SFTRunner(cfg, ActorGroup())
+    assert resumed.checkpoint_tracker.best_step == 2
 
 
 @pytest.mark.parametrize("params_collection", [False, True])
@@ -805,3 +952,256 @@ def test_arx_stage2_configs_refuse_missing_model_and_calibration_inputs(
         return
     with pytest.raises(InterpolationResolutionError, match=missing):
         OmegaConf.resolve(cfg)
+
+
+class _ActionProbeResult:
+    """Completed remote result at the runner's actor-group boundary."""
+
+    def __init__(self, value=None):
+        self.value = value
+
+    def wait(self):
+        return self.value
+
+    def consume_duration(self):
+        return 0.001
+
+
+class _ActionProbeActorGroup:
+    """Minimal remote training actor that records public calls and output steps."""
+
+    def __init__(self):
+        self.updates = 0
+        self.events = []
+
+    def get_max_steps_per_epoch(self):
+        return _ActionProbeResult([10])
+
+    def run_training(self):
+        self.updates += 1
+        self.events.append(("train", self.updates))
+        return _ActionProbeResult([{"loss": 1.0}])
+
+    def run_eval(self):
+        self.events.append(("eval", self.updates))
+        return _ActionProbeResult([{"action_mse": 0.5}])
+
+    def extract_action_probe_features(self, output_dir, global_step):
+        self.events.append(("extract", global_step))
+        Path(output_dir, "features.npz").write_bytes(b"remote feature archive")
+        return _ActionProbeResult()
+
+
+def _action_probe_runner_config(tmp_path, *, enabled=True, at_start=False):
+    return OmegaConf.create(
+        {
+            "runner": {
+                "max_steps": 5,
+                "max_epochs": -1,
+                "val_check_interval": 2,
+                "save_interval": -1,
+                "eval_at_start": True,
+                "action_probe": {
+                    "enabled": enabled,
+                    "interval": 4,
+                    "at_start": at_start,
+                    "input_dir": str(tmp_path / "inputs"),
+                    "methods": ["ridge"],
+                    "cpu_threads": 2,
+                    "max_epochs": 3,
+                    "patience": 1,
+                },
+                "logger": {
+                    "log_path": str(tmp_path),
+                    "experiment_name": "probe",
+                    "logger_backends": ["tensorboard"],
+                },
+            },
+            "actor": {
+                "model": {"model_type": "openpi_rlinf", "openpi": {"use_rlt": True}}
+            },
+            "cluster": {"num_nodes": 1},
+        }
+    )
+
+
+def _record_cpu_action_probe(monkeypatch, actor, tmp_path):
+    """Keep fitting outside the orchestration test; its component has real tests."""
+    import rlinf.utils.action_probe as probes
+
+    def fit(features, split, output, **kwargs):
+        step = int(features.parent.name.removeprefix("global_step_"))
+        actor.events.append(("fit", step))
+        assert features.is_file()
+        assert split == tmp_path / "inputs" / "probe_split.json"
+        assert output == features.parent / "probe_results"
+        assert kwargs == {
+            "methods": ("ridge",),
+            "threads": 2,
+            "max_epochs": 3,
+            "patience": 1,
+        }
+        return {
+            "metrics": {"ridge/state_z/chunk/all/mse": 0.25},
+            "reports": {"ridge": str(output / "ridge" / "report.json")},
+        }
+
+    monkeypatch.setattr(probes, "run_action_probes", fit)
+
+
+@pytest.mark.parametrize("at_start", [False, True])
+def test_sft_action_probe_schedules_interval_final_and_initial_validation(
+    tmp_path, monkeypatch, at_start
+):
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+    from rlinf.runners.sft_runner import SFTRunner
+
+    cfg = _action_probe_runner_config(tmp_path, at_start=at_start)
+    actor = _ActionProbeActorGroup()
+    _record_cpu_action_probe(monkeypatch, actor, tmp_path)
+    SFTRunner(cfg, actor).run()
+    expected_probe_steps = ([0] if at_start else []) + [4, 5]
+    assert actor.updates == 5
+    assert [step for call, step in actor.events if call == "eval"] == [0, 2, 4, 5]
+    assert [
+        step for call, step in actor.events if call == "extract"
+    ] == expected_probe_steps
+    assert [
+        step for call, step in actor.events if call == "fit"
+    ] == expected_probe_steps
+    for step in expected_probe_steps:
+        assert actor.events.index(("eval", step)) < actor.events.index(
+            ("extract", step)
+        )
+        assert actor.events.index(("extract", step)) < actor.events.index(("fit", step))
+    history = [
+        json.loads(line)
+        for line in (tmp_path / "probe" / "validation_metrics.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    assert [record["global_step"] for record in history] == [0, 2, 4, 5]
+    key = "rlt_probe/ridge/state_z/chunk/all/mse"
+    assert [
+        record["global_step"] for record in history if key in record["metrics"]
+    ] == expected_probe_steps
+    assert all(record["metrics"]["action_mse"] == 0.5 for record in history)
+    events = EventAccumulator(str(tmp_path / "tensorboard")).Reload()
+    assert [
+        record.step for record in events.Scalars(f"eval/{key}")
+    ] == expected_probe_steps
+    assert [record.step for record in events.Scalars("train/loss")] == [1, 2, 3, 4, 5]
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_sft_action_probe_disabled_preserves_existing_runner_behavior(
+    tmp_path, configured
+):
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+    from rlinf.runners.sft_runner import SFTRunner
+
+    cfg = _action_probe_runner_config(tmp_path, enabled=False)
+    if configured:
+        # Disabled settings cannot add validation requirements to old configs.
+        cfg.runner.action_probe.interval = 0
+        del cfg.actor
+        del cfg.cluster
+    else:
+        del cfg.runner.action_probe
+    actor = _ActionProbeActorGroup()
+    SFTRunner(cfg, actor).run()
+    assert actor.updates == 5
+    assert [step for call, step in actor.events if call == "eval"] == [0, 2, 4, 5]
+    assert not any(call in {"extract", "fit"} for call, _ in actor.events)
+    assert not (tmp_path / "probe" / "validation_metrics.jsonl").exists()
+    events = EventAccumulator(str(tmp_path / "tensorboard")).Reload()
+    assert [record.step for record in events.Scalars("train/loss")] == [0, 1, 2, 3, 4]
+    assert not any("rlt_probe" in tag for tag in events.Tags()["scalars"])
+
+
+def test_sft_action_probe_explicit_evaluation_runs_outside_periodic_schedule(
+    tmp_path, monkeypatch
+):
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+    from rlinf.runners.sft_runner import SFTRunner
+
+    actor = _ActionProbeActorGroup()
+    _record_cpu_action_probe(monkeypatch, actor, tmp_path)
+    runner = SFTRunner(_action_probe_runner_config(tmp_path), actor)
+    result = runner.run_eval()
+    key = "rlt_probe/ridge/state_z/chunk/all/mse"
+    assert result == {"action_mse": 0.5, key: 0.25}
+    assert actor.events == [("eval", 0), ("extract", 0), ("fit", 0)]
+    assert actor.updates == 0
+    history = json.loads((tmp_path / "probe" / "validation_metrics.jsonl").read_text())
+    assert history == {"global_step": 0, "metrics": result}
+    events = EventAccumulator(str(tmp_path / "tensorboard")).Reload()
+    assert [record.step for record in events.Scalars(f"eval/{key}")] == [0]
+
+
+@pytest.mark.parametrize("purge_step", [None, 4])
+def test_metric_logger_tensorboard_resume_purges_only_replaced_steps(
+    tmp_path, purge_step
+):
+    from rlinf.utils.metric_logger import MetricLogger
+
+    cfg = _action_probe_runner_config(tmp_path, enabled=False)
+    first = MetricLogger(cfg)
+    for step in range(6):
+        first.log({"train/loss": float(step)}, step)
+    first.finish()
+    cfg.runner.logger.tensorboard_purge_step = purge_step
+    resumed = MetricLogger(cfg)
+    resumed.log({"train/loss": 40.0}, 4)
+    resumed.finish()
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+    events = EventAccumulator(str(tmp_path / "tensorboard")).Reload()
+    values = [(record.step, record.value) for record in events.Scalars("train/loss")]
+    expected = [(step, float(step)) for step in range(6 if purge_step is None else 4)]
+    assert values == expected + [(4, 40.0)]
+
+
+@pytest.mark.parametrize("purge_step", [-1, True, 1.5, "4"])
+def test_metric_logger_rejects_invalid_tensorboard_purge_step(tmp_path, purge_step):
+    from rlinf.utils.metric_logger import MetricLogger
+
+    cfg = _action_probe_runner_config(tmp_path, enabled=False)
+    cfg.runner.logger.tensorboard_purge_step = purge_step
+    with pytest.raises(ValueError, match="purge_step"):
+        MetricLogger(cfg)
+
+
+@pytest.mark.parametrize("interval", [0, -1, 3, True, 1.5])
+def test_sft_action_probe_rejects_unreachable_or_noninteger_intervals(
+    tmp_path, interval
+):
+    from rlinf.runners.sft_runner import SFTRunner
+
+    cfg = _action_probe_runner_config(tmp_path)
+    cfg.runner.action_probe.interval = interval
+    with pytest.raises(ValueError, match="positive multiple"):
+        SFTRunner(cfg, _ActionProbeActorGroup())
+
+
+@pytest.mark.parametrize(
+    "interval,message",
+    [(4, "every validation"), (2, "action_probe.at_start")],
+)
+def test_sft_action_probe_selection_requires_metric_at_every_saved_validation(
+    tmp_path, interval, message
+):
+    from rlinf.runners.sft_runner import SFTRunner
+
+    cfg = _action_probe_runner_config(tmp_path)
+    cfg.runner.action_probe.interval = interval
+    cfg.runner.checkpoint_selection = {
+        "metric": "rlt_probe/ridge/state_z/chunk/all/mse",
+        "mode": "min",
+        "keep_last": 1,
+    }
+    with pytest.raises(ValueError, match=message):
+        SFTRunner(cfg, _ActionProbeActorGroup())

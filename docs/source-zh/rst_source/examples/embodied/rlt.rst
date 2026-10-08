@@ -375,7 +375,7 @@ human intervention action，那么这一步的 BC target 会切换成人类动�
        --config-name umi_rlt_stage1_sft_openpi_pi05_20k \
        runner.logger.log_path=/path/to/rlt_runs
 
-该命令将 loader 的 JAX 运算限制在 CPU，并关闭 PyTorch 训练中的 TF32。训练每隔 2,000 个 optimizer step 保存完整 checkpoint，第 20,000 步也会保存。应为数据缓存和全部 10 个 checkpoint 预留磁盘空间；保存间隔由 ``runner.save_interval`` 控制，已保存的 checkpoint 会保留。训练期间观察 ``vla_loss``、``rlt_loss``、梯度范数和学习率。VLA SFT worker 的动作质量与 RL token 表征质量需要单独评估，训练 loss 本身不能证明这两项结果。
+该命令将 loader 的 JAX 运算限制在 CPU，并关闭 PyTorch 训练中的 TF32。训练每隔 2,000 个 optimizer step 保存完整 checkpoint，第 20,000 步也会保存。应为数据缓存和全部 10 个 checkpoint 预留磁盘空间；保存间隔由 ``runner.save_interval`` 控制，已保存的 checkpoint 会保留。训练期间观察 ``vla_loss``、``rlt_loss``、梯度范数和学习率。该配置没有启用独立验证；下面的验证配置可以在训练期间检查动作质量和 token 重建效果，训练 loss 本身不能证明这两项结果。
 
 20k 配置通过 ``data.save_openpi_resume_state: true`` 支持在首个数据 epoch 内恢复采样位置。每个 checkpoint 的 ``actor/openpi_resume_state.pt`` 保存各 rank 已读取的样本数和训练 RNG 状态。将 ``runner.resume_dir`` 指向 ``checkpoints/global_step_<N>`` 目录，即可随模型、优化器和 scheduler 一起恢复这些状态。恢复时先重放确定性的 UMI V4 loader 到已保存的位置，再恢复各 rank 的训练 RNG 状态。
 
@@ -384,6 +384,84 @@ human intervention action，那么这一步的 BC target 会切换成人类动�
 .. warning::
 
    官方 OpenPI loader 只有在启用 UMI V4 恢复选项且 checkpoint 包含对应状态文件时，才会恢复采样位置和训练 RNG。若选项未启用或状态文件缺失，``runner.resume_dir`` 仅恢复模型、优化器和 scheduler，数据采样会重新开始。UMI 恢复格式不恢复数据加载 worker 内部随机 transform 的状态。
+
+在保留的 episode 上验证 UMI Stage 1
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+若要用未参与 Stage 1 更新的示范选择 checkpoint，应在训练开始前按完整 episode 划分数据。重复录制应归入同一侧，必要时按采集来源分层。将两组互不重叠的原始 episode ID 写成 JSON 列表，例如 ``[0, 3, 7]``。从原始基础 checkpoint 开始，并设置 ``runner.resume_dir: null``；继续使用已经训练过这些验证 episode 的模型，会使这次划分失去作用。
+
+使用 ``examples/sft/config/umi_rlt_stage1_sft_openpi_pi05_holdout.yaml``，按上文配置数据集、基础模型和归一化路径。训练和验证路径指向同一个 LeRobot 目录，再提供两组 episode 列表：
+
+.. code:: yaml
+
+   data:
+     train_data_paths: /path/to/umi_lerobot_dataset
+     val_data_paths: /path/to/umi_lerobot_dataset
+     train_episode_ids: /path/to/train_episode_ids.json
+     val_episode_ids: /path/to/val_episode_ids.json
+     val_frames_per_episode: 36
+     val_num_batches: null
+     eval_seed: 20260924
+     eval_num_steps: 10
+     eval_token_shuffle: true
+   actor:
+     eval_batch_size: 9
+   runner:
+     resume_dir: null
+     eval_at_start: true
+     val_check_interval: 1000
+     save_interval: 1000
+     checkpoint_selection:
+       metric: action_mse
+       mode: min
+       keep_last: 1
+
+Loader 复用完整数据集的 Arrow 缓存，通过 subset 选择帧，不复制图像数据。训练使用所选 episode 的全部帧。验证从每个 episode 均匀抽取 36 帧并包含首尾，再将不同 episode 交错排列，使每个 rank 内的 token 循环移位来自其他 episode；loader 会检查这一条件。60 个验证 episode、8 个 rank、每卡 batch 为 9 时，2,160 帧恰好构成每 rank 30 批。其他规模下不足一个 global batch 的尾部会被丢弃，数量记录在 loader 的选择 metadata 中。设置 ``val_frames_per_episode: null`` 可验证保留 episode 的全部帧；若该顺序无法保证 donor 来自其他 episode，应同时设置 ``eval_token_shuffle: false``。``val_num_batches`` 可限制诊断批次数；保持 null 则遍历完整的已选验证样本。
+
+验证关闭图像增强，使用固定 RNG seed，并在结束后恢复训练 RNG 和各模块模式。指标包括 ``vla_loss``、``rlt_loss``、打乱 token 后的重建 loss 与比例，以及 10 步采样得到的归一化动作 MAE/MSE。动作 mask 排除 padding 维度。重建 loss 降低本身不能证明下游 RL policy 改善。
+
+Runner 在第一次更新前评估初始模型，并选择 ``action_mse`` 最低的 checkpoint。``checkpoints/validation_selection.json`` 记录其步数、分数和路径，``validation_metrics.jsonl`` 按 optimizer step 记录每次验证。保存管理会保留最佳与最近一次 checkpoint；只有新保存成功后，才会清理这个 tracker 已登记的其他 checkpoint。保存过程中还应为额外一个 checkpoint 预留空间。已有 20k 配置的保留规则保持不变。
+
+使用与 20k 训练相同的环境变量启动此配置：
+
+.. code:: bash
+
+   python examples/sft/train_vla_sft.py \
+       --config-name umi_rlt_stage1_sft_openpi_pi05_holdout \
+       runner.logger.log_path=/path/to/rlt_holdout_runs
+
+从最近保留的 ``global_step_<N>`` 目录恢复时，保持 split 文件、sampler 设置和输出目录一致。恢复位置还会检查 episode ID 和帧顺序签名。已有选择记录的输出目录不能直接重新从零训练；回退到更早 checkpoint 应使用新输出目录。归一化应与基础模型一致；Stage 1 的保留划分并不证明预训练 VLA 从未见过这些录制。用于选择 checkpoint 的数据属于验证集，最终泛化与闭环测试仍需另备数据。
+
+在验证中评估 token 的动作信息
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+保留验证集的配置可以在验证阶段拟合诊断用动作预测头，评估 token 是否提供了超出机器人状态的信息。先使用相同的 OpenPI transforms 和归一化、关闭图像增强，准备固定输入，再启用以下可选配置：
+
+.. code:: yaml
+
+   runner:
+     action_probe:
+       enabled: true
+       input_dir: /path/to/prepared_probe_inputs
+       interval: 5000
+       at_start: false
+       batch_size: 9
+       methods: [ridge, mlp]
+       cpu_threads: 4
+       max_epochs: 100
+       patience: 15
+       random_seed: 271828
+       image_seed: 20260925
+
+准备目录包含观测、状态、动作和帧标识的 NumPy 数组，以及 ``probe_split.json``、``samples.jsonl``、``provenance.json`` 和标记通过的 ``input_quality_check.json``。``rlinf/data/datasets/openpi_rlinf/action_probe.py`` 中的 ``PreparedActionProbeInputs`` 会核对这些文件与训练的数据集、归一化和 episode 划分是否一致。从训练 episode 内部分出预测头的拟合集和调参集；验证 episode 仅用于最终评分，不参与拟合或选参。每个 episode 保留固定帧，保证不同训练步的结果可比较。
+
+所有 actor 使用已加载的模型提取特征，然后由 driver 在 CPU 上拟合 ridge 和三个 seed 的 MLP 预测头。此过程在单节点共享文件系统中同步执行，不额外加载 backbone，也不更新训练模型；结束后恢复 RNG、模块模式并保留训练数据游标。启动前设置 ``OMP_NUM_THREADS``、``MKL_NUM_THREADS`` 和 ``OPENBLAS_NUM_THREADS`` 以限制 BLAS 线程数；``cpu_threads`` 控制拟合期间的 Torch 线程数。
+
+对比包括仅状态、状态加训练后的 token、状态加固定随机 encoder 的 token。打乱 token、均值 token 和跨 episode 图像替换进一步检查模型是否依赖当前样本的信息。报告使用 episode 等权动作误差和配对 episode bootstrap 区间。``eval/rlt_probe/mlp/state_z_vs_state_only/chunk/all/relative_mse_improvement`` 为正，表示加入训练后的 token 降低了误差；对应的 ``relative_mse_improvement_ci95_low``、``relative_mse_improvement_ci95_high`` 表示不确定性。同一命名空间也包含 ridge 和其他对照的结果。数值为比例，不是百分数。离线预测改善不能直接证明闭环 RL 成功。
+
+新增指标与普通验证一起写入 TensorBoard 和 ``validation_metrics.jsonl``；特征和详细报告保存在 ``<log_path>/<experiment_name>/action_probe/global_step_<N>/``。执行间隔必须是 ``val_check_interval`` 的整数倍，最后一步也会执行。``at_start`` 控制训练开始时的验证；单独调用 ``SFTRunner.run_eval()`` 总会执行已启用的 probe。默认仍按 ``action_mse`` 选择 checkpoint；若改用 probe 指标，则每次验证都必须执行 probe，包括已启用的初始验证。
+
+如果保存 checkpoint 后又执行了未保存的更新，恢复时将 ``runner.logger.tensorboard_purge_step`` 设为第一个需要重新计算的步数。TensorBoard 会隐藏旧的后续事件并保留之前的历史；若有意回退 checkpoint 选择记录，应使用新的输出目录。
 
 运行当前 Franka 示例
 --------------------

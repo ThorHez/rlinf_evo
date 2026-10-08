@@ -16,6 +16,7 @@
 
 import asyncio
 import copy
+import dataclasses
 import inspect
 import io
 import json
@@ -2955,6 +2956,251 @@ def test_openpi_resume_rejects_incompatible_data_order(changed):
         restore_openpi_sft_iterator(loader, state)
 
 
+class _OpenPiEpisodeDataset(torch.utils.data.Dataset):
+    """In-memory LeRobot boundary with observable episode and original row IDs."""
+
+    def __init__(self, lengths=(7, 8, 9, 10, 11, 12)):
+        ends = np.cumsum(lengths)
+        self.episode_data_index = {
+            "from": torch.tensor(np.r_[0, ends[:-1]]),
+            "to": torch.tensor(ends),
+        }
+        self.meta = SimpleNamespace(
+            episodes={i: {"length": length} for i, length in enumerate(lengths)}
+        )
+        self.episodes = np.repeat(np.arange(len(lengths)), lengths)
+
+    def __len__(self):
+        return len(self.episodes)
+
+    def __getitem__(self, index):
+        index = int(index)
+        return {
+            "state": np.asarray([self.episodes[index], index], dtype=np.float32),
+            "image": {"base_0_rgb": np.zeros((8, 8, 3), dtype=np.float32)},
+            "image_mask": {"base_0_rgb": np.True_},
+            "actions": np.asarray([[self.episodes[index], index]], dtype=np.float32),
+        }
+
+
+@pytest.fixture
+def openpi_episode_loader(monkeypatch, tmp_path):
+    """Use real OpenPI transforms, batching and distributed samplers."""
+    from omegaconf import OmegaConf
+
+    module = pytest.importorskip("openpi.training.data_loader")
+    config_module = pytest.importorskip("openpi.training.config")
+    from rlinf.data.datasets.openpi_rlinf.official_sft_data_loader import (
+        build_official_openpi_sft_dataloader,
+    )
+    from rlinf.models.embodiment.openpi import dataconfig
+
+    dataset = _OpenPiEpisodeDataset()
+    data_config = config_module.DataConfig(
+        repo_id=str(tmp_path), norm_stats={}, action_sequence_keys=()
+    )
+
+    @dataclasses.dataclass
+    class TestConfig:
+        data: object
+        model: object
+        assets_dirs: object
+        num_workers: int = 0
+        seed: int = 11
+
+    official = TestConfig(
+        data=SimpleNamespace(create=lambda *_: data_config),
+        model=SimpleNamespace(action_horizon=1, action_dim=2),
+        assets_dirs=tmp_path,
+    )
+    monkeypatch.setattr(dataconfig, "get_openpi_config", lambda *a, **k: official)
+    # The external dataset factory opens the full dataset once; Subset and all
+    # subsequent transforms/sampling use production implementations.
+    monkeypatch.setattr(
+        module,
+        "create_torch_dataset",
+        lambda *a: module.TransformedDataset(dataset, []),
+    )
+    cfg = OmegaConf.create(
+        {
+            "actor": {
+                "micro_batch_size": 3,
+                "eval_batch_size": 3,
+                "seed": 11,
+                "model": {
+                    "model_type": "openpi_rlinf",
+                    "model_path": str(tmp_path),
+                    "num_action_chunks": 1,
+                    "openpi": {"config_name": "test", "model_action_dim": 2},
+                },
+            },
+            "data": {
+                "num_workers": 0,
+                "train_data_paths": str(tmp_path),
+                "val_data_paths": str(tmp_path),
+                "train_episode_ids": [0, 2, 4],
+                "val_episode_ids": [1, 3, 5],
+                "val_frames_per_episode": 4,
+                "val_num_batches": None,
+                "eval_seed": 17,
+            },
+        }
+    )
+
+    def build(rank=0, world_size=2, evaluate=False):
+        return build_official_openpi_sft_dataloader(
+            cfg, world_size, rank, str(tmp_path), eval_dataset=evaluate
+        )[0]
+
+    return cfg, dataset, build
+
+
+def test_openpi_episode_split_preserves_original_frames_and_rank_disjointness(
+    openpi_episode_loader,
+):
+    from itertools import islice
+
+    from rlinf.data.datasets.openpi_rlinf.official_sft_data_loader import (
+        get_official_openpi_sft_num_batches,
+    )
+
+    _, dataset, build = openpi_episode_loader
+    rank_rows = []
+    for rank in range(2):
+        loader = build(rank)
+        batches = list(islice(loader, get_official_openpi_sft_num_batches(loader)))
+        actions = torch.cat([batch[1][:, 0] for batch in batches])
+        assert set(actions[:, 0].tolist()) <= {0, 2, 4}
+        rows = actions[:, 1].long().tolist()
+        assert len(set(rows)) == len(rows)
+        assert loader.episode_selection["selected_frame_count"] == 27
+        assert loader.episode_selection["source_frame_count"] == len(dataset)
+        assert loader.episode_selection["tail_frames_dropped"] == 3
+        rank_rows.append(set(rows))
+    assert rank_rows[0].isdisjoint(rank_rows[1])
+    assert len(rank_rows[0] | rank_rows[1]) == 24
+
+
+def test_openpi_validation_is_finite_repeatable_and_interleaves_episodes(
+    openpi_episode_loader,
+):
+    _, dataset, build = openpi_episode_loader
+    combined = set()
+    for rank in range(2):
+        loader = build(rank, evaluate=True)
+        batches = list(loader)
+        assert len(batches) == 2
+        repeated = list(loader)
+        for first, second in zip(batches, repeated, strict=True):
+            torch.testing.assert_close(first[1], second[1], rtol=0, atol=0)
+            episodes = first[1][:, 0, 0]
+            assert torch.all(episodes != episodes.roll(1))
+            assert set(episodes.tolist()) == {1, 3, 5}
+        indices = torch.cat([item[1][:, 0, 1] for item in batches]).long().tolist()
+        assert combined.isdisjoint(indices)
+        combined.update(indices)
+        assert loader.episode_selection["cross_episode_shuffle_verified"]
+        assert loader.episode_selection["tail_frames_dropped"] == 0
+    expected = set()
+    for episode in (1, 3, 5):
+        start = int(dataset.episode_data_index["from"][episode])
+        end = int(dataset.episode_data_index["to"][episode])
+        expected.update(
+            (np.linspace(0, end - start - 1, 4, dtype=np.int64) + start).tolist()
+        )
+    assert combined == expected
+
+
+def test_openpi_validation_budget_does_not_cycle_dataset(openpi_episode_loader):
+    from rlinf.data.datasets.openpi_rlinf.official_sft_data_loader import (
+        get_official_openpi_sft_num_batches,
+    )
+
+    cfg, _, build = openpi_episode_loader
+    cfg.data.val_num_batches = 1
+    loader = build(evaluate=True)
+    assert len(list(loader)) == get_official_openpi_sft_num_batches(loader) == 1
+    cfg.data.val_num_batches = 100
+    loader = build(evaluate=True)
+    assert len(list(loader)) == get_official_openpi_sft_num_batches(loader) == 2
+
+
+def test_openpi_episode_ids_can_be_loaded_from_json(openpi_episode_loader, tmp_path):
+    from rlinf.data.datasets.openpi_rlinf.official_sft_data_loader import (
+        get_openpi_sft_data_order,
+    )
+
+    cfg, _, build = openpi_episode_loader
+    original = get_openpi_sft_data_order(build())
+    path = tmp_path / "train_episode_ids.json"
+    path.write_text(json.dumps([0, 2, 4]))
+    cfg.data.train_episode_ids = str(path)
+    assert get_openpi_sft_data_order(build()) == original
+
+
+def test_openpi_episode_subsets_work_with_huggingface_integer_keys(
+    openpi_episode_loader, monkeypatch
+):
+    datasets = pytest.importorskip("datasets")
+    _, dataset, build = openpi_episode_loader
+    storage = datasets.Dataset.from_dict({"original_index": list(range(len(dataset)))})
+    read_observation = dataset.__getitem__
+
+    def read_huggingface_row(self, index):
+        # Exercise the real Arrow-backed Dataset key validation before the
+        # small LeRobot stand-in turns the row into observation tensors.
+        row = storage[index]
+        return read_observation(row["original_index"])
+
+    monkeypatch.setattr(_OpenPiEpisodeDataset, "__getitem__", read_huggingface_row)
+    for rank in range(2):
+        train_actions = next(iter(build(rank)))[1]
+        assert set(train_actions[:, 0, 0].tolist()) <= {0, 2, 4}
+        val_batches = list(build(rank, evaluate=True))
+        assert len(val_batches) == 2
+        for _, actions in val_batches:
+            assert set(actions[:, 0, 0].tolist()) == {1, 3, 5}
+
+
+@pytest.mark.parametrize(
+    "case", ["overlap", "duplicate", "unknown", "too_short", "donor"]
+)
+def test_openpi_episode_selection_rejects_invalid_splits(openpi_episode_loader, case):
+    cfg, _, build = openpi_episode_loader
+    world_size = 2
+    if case == "overlap":
+        cfg.data.val_episode_ids = [0, 1, 3]
+    elif case == "duplicate":
+        cfg.data.val_episode_ids = [1, 1, 3]
+    elif case == "unknown":
+        cfg.data.val_episode_ids = [1, 3, 60]
+    elif case == "too_short":
+        cfg.data.val_frames_per_episode = 20
+    else:
+        world_size = 3
+    with pytest.raises(ValueError):
+        build(world_size=world_size, evaluate=True)
+
+
+def test_openpi_resume_rejects_same_size_different_episode_selection(
+    openpi_episode_loader,
+):
+    from rlinf.data.datasets.openpi_rlinf.official_sft_data_loader import (
+        get_openpi_sft_data_order,
+        restore_openpi_sft_iterator,
+    )
+
+    cfg, _, build = openpi_episode_loader
+    loader = build()
+    saved = get_openpi_sft_data_order(loader)
+    saved.update(consumed_samples=6, data_epoch=0)
+    # The new episodes have the same 27 frames, but a different underlying order.
+    cfg.data.train_episode_ids = [0, 1, 5]
+    cfg.data.val_episode_ids = [2, 3, 4]
+    with pytest.raises(ValueError, match="episode selection"):
+        restore_openpi_sft_iterator(build(), saved)
+
+
 def test_arx_transition_split_merge_preserves_executed_actions_and_validity():
     executed = torch.arange(60, dtype=torch.float32).reshape(3, 20)
     valid = torch.tensor([[True], [False], [True]])
@@ -3665,3 +3911,209 @@ def test_arx_rlt_td3_actor_q_aggregation(aggregation, expected):
     learner.cfg.algorithm.actor_agg_q = "unsupported"
     with pytest.raises(ValueError, match="actor_agg_q"):
         learner._td3_actor_q(twin_q)
+
+
+def test_prepared_action_probe_padding_and_collective_schedule(action_probe_prepared):
+    from rlinf.data.datasets.openpi_rlinf.action_probe import PreparedActionProbeInputs
+
+    directory, cfg = action_probe_prepared
+    inputs = PreparedActionProbeInputs(directory, cfg, image_seed=7)
+    batches = [
+        inputs.batch(round_index, rank, world_size=3, batch_size=2)
+        for round_index in range(inputs.batch_count(3, 2))
+        for rank in range(3)
+    ]
+    actual = np.concatenate([batch.indices[batch.valid] for batch in batches])
+    np.testing.assert_array_equal(actual, np.arange(8))
+    assert all(batch.globalbatch_has_holdout for batch in batches)
+    assert not np.any(batches[0].metadata["split"] == 2)
+    assert not batches[-1].valid.any()
+    np.testing.assert_array_equal(batches[-1].indices, [7, 7])
+    assert all(batch.observation["state"].shape == (2, 32) for batch in batches)
+    assert (
+        inputs.batch(0, 0, world_size=1, batch_size=2).globalbatch_has_holdout is False
+    )
+    with pytest.raises(ValueError, match="positive"):
+        inputs.batch_count(0, 2)
+    with pytest.raises(ValueError, match="rank or round"):
+        inputs.batch(2, 0, world_size=3, batch_size=2)
+
+
+def test_prepared_action_probe_image_control_is_holdout_only(action_probe_prepared):
+    from rlinf.data.datasets.openpi_rlinf.action_probe import PreparedActionProbeInputs
+
+    directory, cfg = action_probe_prepared
+    inputs = PreparedActionProbeInputs(directory, cfg, image_seed=7)
+    same = PreparedActionProbeInputs(directory, cfg, image_seed=7)
+    np.testing.assert_array_equal(inputs.image_donors, same.image_donors)
+    np.testing.assert_array_equal(inputs.image_donors[:4], np.arange(4))
+    np.testing.assert_array_equal(np.sort(inputs.image_donors[4:]), np.arange(4, 8))
+    episodes = inputs.arrays["episode_id"]
+    assert np.all(episodes[inputs.image_donors[4:]] != episodes[4:])
+    batch = inputs.batch(0, 0, world_size=1, batch_size=8)
+    for key in ("state", "tokenized_prompt", "tokenized_prompt_mask"):
+        np.testing.assert_array_equal(
+            batch.observation[key], batch.donor_observation[key]
+        )
+    for key in batch.observation["image"]:
+        np.testing.assert_array_equal(
+            batch.observation["image_mask"][key],
+            batch.donor_observation["image_mask"][key],
+        )
+        np.testing.assert_array_equal(
+            batch.donor_observation["image"][key][:4],
+            batch.observation["image"][key][:4],
+        )
+    assert not np.array_equal(
+        batch.observation["image"]["left_wrist_0_rgb"][4:],
+        batch.donor_observation["image"]["left_wrist_0_rgb"][4:],
+    )
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    ["train", "validation", "norm", "split_hash", "qc", "sample_hash", "header"],
+)
+def test_prepared_action_probe_rejects_mismatched_inputs(
+    action_probe_prepared, mismatch
+):
+    from pathlib import Path
+
+    from rlinf.data.datasets.openpi_rlinf.action_probe import PreparedActionProbeInputs
+
+    directory, cfg = action_probe_prepared
+    if mismatch == "train":
+        cfg.data.train_episode_ids = [1, 2, 9]
+    elif mismatch == "validation":
+        cfg.data.val_episode_ids = [3, 5]
+    elif mismatch == "norm":
+        Path(cfg.actor.model.openpi_data.norm_stats_path).write_text("changed")
+    elif mismatch == "split_hash":
+        (directory / "probe_split.json").write_text("{}")
+    elif mismatch == "qc":
+        (directory / "input_quality_check.json").write_text('{"passed": false}')
+    elif mismatch == "sample_hash":
+        (directory / "samples.jsonl").write_text("changed")
+    else:
+        np.save(directory / "state.npy", np.zeros((8, 31), dtype=np.float32))
+    with pytest.raises(ValueError, match="Action-probe|Action probe"):
+        PreparedActionProbeInputs(directory, cfg)
+
+
+def test_prepared_action_probe_checks_original_pipeline_config(action_probe_prepared):
+    import hashlib
+
+    from rlinf.data.datasets.openpi_rlinf.action_probe import PreparedActionProbeInputs
+
+    directory, cfg = action_probe_prepared
+    cfg.actor.model.openpi.config_name = "original_pipeline"
+    source = directory / "resolved_config.yaml"
+    OmegaConf.save(cfg, source)
+    path = directory / "provenance.json"
+    provenance = json.loads(path.read_text())
+    provenance["source_files_sha256"][str(source)] = hashlib.sha256(
+        source.read_bytes()
+    ).hexdigest()
+    path.write_text(json.dumps(provenance))
+    cfg.actor.model.openpi.config_name = "different_pipeline"
+    with pytest.raises(ValueError, match="model/data configuration mismatch"):
+        PreparedActionProbeInputs(directory, cfg)
+
+
+def _write_action_probe_shards(directory, inputs, fault=None):
+    for rank in range(3):
+        batches = [
+            inputs.batch(index, rank, 3, 2) for index in range(inputs.batch_count(3, 2))
+        ]
+        indices = np.concatenate([batch.indices for batch in batches])
+        valid = np.concatenate([batch.valid for batch in batches])
+        if rank == 0 and fault == "duplicate":
+            indices[1] = indices[0]
+        if rank == 0 and fault == "missing":
+            valid[0] = False
+        values = np.repeat(indices[:, None], inputs.embedding_dim, axis=1).astype(
+            np.float32
+        )
+        payload = {
+            "indices": indices,
+            "valid": valid,
+            "z": values,
+            "z_random": values + 1,
+            "z_image_swapped": values + 2,
+            **{key: inputs.arrays[key][indices].copy() for key in batches[0].metadata},
+        }
+        if rank == 0 and fault == "metadata":
+            payload["actions"][0, 0, 0] += 1
+        if rank == 0 and fault == "nonfinite":
+            payload["z"][0, 0] = np.nan
+        np.savez(directory / f"rank_{rank:05d}.npz", **payload)
+
+
+def test_merge_action_probe_shards_preserves_order_and_metadata(
+    action_probe_prepared, tmp_path
+):
+    import hashlib
+
+    from rlinf.data.datasets.openpi_rlinf.action_probe import (
+        PreparedActionProbeInputs,
+        merge_action_probe_shards,
+    )
+
+    directory, cfg = action_probe_prepared
+    inputs = PreparedActionProbeInputs(directory, cfg)
+    output = tmp_path / "features"
+    output.mkdir()
+    _write_action_probe_shards(output, inputs)
+    report = merge_action_probe_shards(output, inputs, 3)
+    assert report["sample_count"] == 8
+    assert (
+        report["features_sha256"]
+        == hashlib.sha256((output / "features.npz").read_bytes()).hexdigest()
+    )
+    with np.load(output / "features.npz", allow_pickle=False) as merged:
+        np.testing.assert_array_equal(merged["z"][:, 0], np.arange(8))
+        np.testing.assert_array_equal(merged["image_donor_index"], inputs.image_donors)
+        for key in (
+            "state",
+            "actions",
+            "episode_id",
+            "frame_index",
+            "dataset_global_index",
+            "split",
+        ):
+            np.testing.assert_array_equal(merged[key], inputs.arrays[key])
+    with pytest.raises(FileExistsError):
+        merge_action_probe_shards(output, inputs, 3)
+
+
+@pytest.mark.parametrize("fault", ["duplicate", "missing", "metadata", "nonfinite"])
+def test_merge_action_probe_shards_rejects_invalid_results(
+    action_probe_prepared, tmp_path, fault
+):
+    from rlinf.data.datasets.openpi_rlinf.action_probe import (
+        PreparedActionProbeInputs,
+        merge_action_probe_shards,
+    )
+
+    directory, cfg = action_probe_prepared
+    inputs = PreparedActionProbeInputs(directory, cfg)
+    output = tmp_path / "features"
+    output.mkdir()
+    _write_action_probe_shards(output, inputs, fault)
+    with pytest.raises(ValueError, match="Action-probe|action-probe"):
+        merge_action_probe_shards(output, inputs, 3)
+    assert not (output / "features.npz").exists()
+
+
+def test_prepared_action_probe_detects_input_changes_during_extraction(
+    action_probe_prepared,
+):
+    from rlinf.data.datasets.openpi_rlinf.action_probe import PreparedActionProbeInputs
+
+    directory, cfg = action_probe_prepared
+    inputs = PreparedActionProbeInputs(directory, cfg)
+    changed = np.load(directory / "state.npy", mmap_mode="r+")
+    changed[0, 0] = 99
+    changed.flush()
+    with pytest.raises(ValueError, match="changed during extraction"):
+        inputs.validate_unchanged()

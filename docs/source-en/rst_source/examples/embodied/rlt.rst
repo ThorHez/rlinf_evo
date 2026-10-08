@@ -463,9 +463,10 @@ The command keeps the loader's JAX operations on CPU and disables TF32 for the
 PyTorch training run. It saves a complete checkpoint every 2,000 optimizer
 steps, including step 20,000. Reserve disk space for the dataset cache and all ten checkpoints;
 ``runner.save_interval`` controls the interval and checkpoints are retained.
-Track ``vla_loss``, ``rlt_loss``, gradient norm, and learning rate. The VLA SFT
-worker requires a separate evaluation procedure to assess action quality and
-the learned RL token; training loss alone does not establish either result.
+Track ``vla_loss``, ``rlt_loss``, gradient norm, and learning rate. This config
+does not enable held-out evaluation; the validation recipe below measures
+action quality and token reconstruction during training. Training loss alone
+does not establish either result.
 
 To resume within the first pass through the dataset, the 20k config enables
 ``data.save_openpi_resume_state: true``. Each checkpoint includes
@@ -490,6 +491,153 @@ bitwise equivalence across those changes.
    disabled or the file absent, ``runner.resume_dir`` restores only model,
    optimizer, and scheduler state, and data sampling restarts. The UMI recovery
    format does not restore random transforms inside data loader workers.
+
+Validate UMI Stage 1 on held-out episodes
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+To select a checkpoint using demonstrations excluded from Stage 1 updates,
+split complete episodes before training. Keep duplicated recordings in the
+same split, and stratify by collection source when appropriate. Write two
+disjoint JSON lists of original episode IDs, for example ``[0, 3, 7]``. Start
+from the original base checkpoint with ``runner.resume_dir: null``; continuing
+a model trained on the validation episodes would invalidate this split.
+
+Use ``examples/sft/config/umi_rlt_stage1_sft_openpi_pi05_holdout.yaml`` with the
+dataset, base model, and normalization paths configured as above. Set the
+same LeRobot directory for both paths and provide the episode lists:
+
+.. code:: yaml
+
+   data:
+     train_data_paths: /path/to/umi_lerobot_dataset
+     val_data_paths: /path/to/umi_lerobot_dataset
+     train_episode_ids: /path/to/train_episode_ids.json
+     val_episode_ids: /path/to/val_episode_ids.json
+     val_frames_per_episode: 36
+     val_num_batches: null
+     eval_seed: 20260924
+     eval_num_steps: 10
+     eval_token_shuffle: true
+   actor:
+     eval_batch_size: 9
+   runner:
+     resume_dir: null
+     eval_at_start: true
+     val_check_interval: 1000
+     save_interval: 1000
+     checkpoint_selection:
+       metric: action_mse
+       mode: min
+       keep_last: 1
+
+The loader reuses the full dataset's Arrow cache and selects frames through a
+subset; it does not copy the image dataset. Training uses every frame of its
+selected episodes. Validation takes 36 evenly spaced frames per episode,
+including both endpoints, and interleaves episodes so token rotation within
+each rank's batch uses a different episode. The loader verifies this condition.
+For 60 validation episodes on eight ranks with batch size nine, all 2,160 frames
+fit exactly into 30 batches per rank. For other sizes, incomplete global batches
+are dropped and their count is recorded in the loader selection metadata.
+Set ``val_frames_per_episode: null`` to evaluate all held-out frames; also set
+``eval_token_shuffle: false`` when that order does not guarantee cross-episode
+donors. ``val_num_batches`` can cap a diagnostic run; leave it null to finish
+the selected validation pass.
+
+Validation disables image augmentation, fixes its RNG seed, and restores the
+training RNG and module modes afterward. It reports ``vla_loss``, ``rlt_loss``,
+the shuffled-token reconstruction loss and ratio, and normalized action MAE/MSE
+from ten sampling steps. The action mask excludes padded dimensions. A lower
+reconstruction loss does not itself establish a better downstream RL policy.
+
+The runner evaluates the initial model before its first update and selects the
+lowest ``action_mse`` checkpoint. ``checkpoints/validation_selection.json``
+records its step, score, and path; ``validation_metrics.jsonl`` records each
+validation at its optimizer step. Checkpoint retention keeps the best and the
+most recent save, pruning only checkpoints registered by this tracker after
+another save succeeds. Budget space for one additional checkpoint while saving.
+The existing 20k config keeps its original retention behavior.
+
+Launch this recipe with the same environment variables as the 20k run:
+
+.. code:: bash
+
+   python examples/sft/train_vla_sft.py \
+       --config-name umi_rlt_stage1_sft_openpi_pi05_holdout \
+       runner.logger.log_path=/path/to/rlt_holdout_runs
+
+Resume from the latest retained ``global_step_<N>`` directory with the same split files,
+sampler settings, and output directory. Cursor recovery also checks the selected
+episode IDs and frame-order signature. An output directory with a selection
+manifest cannot start a fresh run; use a new output directory to roll back to
+an earlier checkpoint. Keep normalization consistent with the
+base model; a Stage 1 holdout does not establish that the pretrained VLA has
+never seen those recordings. Data used to choose a checkpoint is a validation
+set, so final generalization and closed-loop tests need a separate dataset.
+
+Measure Action Information During Validation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The holdout recipe can fit diagnostic action predictors during validation to
+measure whether tokens add information beyond robot state. Prepare fixed inputs
+with the same OpenPI transforms and normalization, with augmentation disabled,
+then enable this optional configuration:
+
+.. code:: yaml
+
+   runner:
+     action_probe:
+       enabled: true
+       input_dir: /path/to/prepared_probe_inputs
+       interval: 5000
+       at_start: false
+       batch_size: 9
+       methods: [ridge, mlp]
+       cpu_threads: 4
+       max_epochs: 100
+       patience: 15
+       random_seed: 271828
+       image_seed: 20260925
+
+The bundle contains observation, state, action and frame-identity NumPy arrays,
+``probe_split.json``, ``samples.jsonl``, ``provenance.json`` and a passed
+``input_quality_check.json``. ``PreparedActionProbeInputs`` in
+``rlinf/data/datasets/openpi_rlinf/action_probe.py`` checks the bundle against the
+configured dataset, normalization and episode split. Split training episodes
+into probe fit and development subsets. Validation episodes only contribute to
+final scoring, never fitting or hyperparameter selection. Retain fixed frames
+per episode so different training steps remain comparable.
+
+All actor ranks extract features from the loaded model; the driver fits ridge
+and three-seed MLP heads on CPU. This synchronous validation currently requires
+one shared-filesystem node. It does not load a second backbone or update the
+trained model. RNG states, module modes and the training cursor are preserved.
+Set ``OMP_NUM_THREADS``, ``MKL_NUM_THREADS`` and ``OPENBLAS_NUM_THREADS`` before
+launch to limit BLAS threads; ``cpu_threads`` controls Torch fitting threads.
+
+Compare state alone, state plus trained tokens, and state plus a fixed random
+encoder's tokens. Shuffled tokens, mean tokens and cross-episode image replacement
+test dependence on sample-specific information. Reports use episode-balanced
+errors and paired episode bootstrap intervals. A positive
+``eval/rlt_probe/mlp/state_z_vs_state_only/chunk/all/relative_mse_improvement``
+means lower error with trained tokens; ``relative_mse_improvement_ci95_low`` and
+``relative_mse_improvement_ci95_high`` give its uncertainty. Values are fractions,
+not percentages. The same namespace contains
+ridge results and other controls. Offline gains do not establish closed-loop
+RL success.
+
+Metrics join normal validation in TensorBoard and ``validation_metrics.jsonl``.
+Features and detailed reports live in
+``<log_path>/<experiment_name>/action_probe/global_step_<N>/``. The interval must
+be a multiple of ``val_check_interval``; probes also run at the final step.
+``at_start`` controls initial training validation; standalone
+``SFTRunner.run_eval()`` always runs enabled probes. The recipe still selects
+checkpoints by ``action_mse``. Selection by a probe metric requires probes at
+every validation, including initial validation if enabled.
+
+When resuming after unsaved updates, set
+``runner.logger.tensorboard_purge_step`` to the first step being recomputed to
+hide stale later TensorBoard events while retaining earlier history. Use a new
+output directory to intentionally roll back checkpoint selection.
 
 Run the Provided Franka Example
 -------------------------------

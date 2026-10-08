@@ -21,6 +21,7 @@ subclasses (eval / RL / DAgger / DSRL) inherit this module.
 
 from __future__ import annotations
 
+import dataclasses
 from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any, Sequence
@@ -855,10 +856,32 @@ class Pi0(model.BaseModel):
         return loss, prefix_out, prefix_mask
 
     def sft_forward(
-        self, data: Any, use_action_chunk_loss: bool = False, **kwargs
+        self,
+        data: Any,
+        use_action_chunk_loss: bool = False,
+        evaluation: bool = False,
+        eval_num_steps: int = 10,
+        eval_token_shuffle: bool = True,
+        feature_only: bool = False,
+        random_encoder: nn.Module | None = None,
+        image_donor_observation: Any = None,
+        **kwargs,
     ) -> torch.Tensor | dict[str, torch.Tensor]:
         """Flow-matching SFT loss. Shared by SFT, DAgger, and PPO co-train."""
         del kwargs
+        if feature_only:
+            return self.sft_probe_features(
+                data,
+                random_encoder=random_encoder,
+                image_donor_observation=image_donor_observation,
+            )
+        if evaluation:
+            return self.sft_eval_forward(
+                data,
+                num_steps=eval_num_steps,
+                token_shuffle=eval_token_shuffle,
+                use_action_chunk_loss=use_action_chunk_loss,
+            )
         observation, actions = self._unpack_sft_batch(data)
         observation = self._observation_to_device(observation)
         actions = self._actions_to_device(actions)
@@ -876,6 +899,150 @@ class Pi0(model.BaseModel):
             "vla_loss": vla_loss,
             "rlt_loss": rlt_loss,
         }
+
+    @torch.no_grad()
+    def sft_probe_features(
+        self,
+        observation: Any,
+        *,
+        random_encoder: nn.Module | None = None,
+        image_donor_observation: Any = None,
+    ) -> dict[str, torch.Tensor]:
+        """Extract frozen action-probe tokens without accepting action labels.
+
+        This path runs inside the training FSDP forward. Image controls replace
+        only images, preserving the target observation's state, prompt and masks.
+        The caller owns the separate random encoder and sets evaluation mode.
+        """
+        self._require_rlt()
+        observation = self._observation_to_device(observation)
+
+        def encode(raw_observation):
+            prepared = model.preprocess_observation(raw_observation, train=False)
+            if self._config.compute_dtype is None:
+                prepared = model._observation_to_dtype(prepared, self.embed_dtype)
+            prefix, mask, cache = self.build_prefix_cache(prepared)
+            del cache
+            return self._select_rlt_prefix_embeddings(
+                prefix, mask, prepared.tokenized_prompt
+            )
+
+        prefix, mask = encode(observation)
+        result = {"z": self._encode_rlt_flat(prefix, mask).float()}
+        if random_encoder is not None:
+            parameter = next(random_encoder.parameters())
+            with self._compute_autocast(prefix.device):
+                result["z_random"] = (
+                    random_encoder(
+                        prefix.to(dtype=parameter.dtype, device=parameter.device),
+                        mask if self.rlt_cfg.rlt_use_mask else None,
+                    )
+                    .flatten(1)
+                    .float()
+                )
+        del prefix, mask
+        if image_donor_observation is not None:
+            donor = self._observation_to_device(image_donor_observation)
+            swapped = dataclasses.replace(observation, images=donor.images)
+            prefix, mask = encode(swapped)
+            result["z_image_swapped"] = self._encode_rlt_flat(prefix, mask).float()
+        else:
+            result["z_image_swapped"] = result["z"]
+        return result
+
+    @torch.no_grad()
+    def sft_eval_forward(
+        self,
+        data: Any,
+        *,
+        num_steps: int = 10,
+        token_shuffle: bool = True,
+        use_action_chunk_loss: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        """Evaluate unaugmented demonstrations inside the normal FSDP forward.
+
+        The caller sets evaluation mode and a reproducible RNG state. Prefix
+        features and their KV cache are shared by flow loss, action sampling,
+        and optional token reconstruction. Token ablation rotates the batch
+        by one position; cross-episode ablation requires an interleaved loader.
+        """
+        if num_steps < 1:
+            raise ValueError("SFT evaluation requires at least one sampling step.")
+        observation, actions = self._unpack_sft_batch(data)
+        observation = self._observation_to_device(observation)
+        actions = self._actions_to_device(actions)
+        batch_size = actions.shape[0]
+        if self.rlt_cfg.use_rlt and token_shuffle and batch_size < 2:
+            raise ValueError("Token shuffle evaluation requires batch size >= 2.")
+        observation = model.preprocess_observation(observation, train=False)
+        if self._config.compute_dtype is None:
+            observation = model._observation_to_dtype(observation, self.embed_dtype)
+        prefix, prefix_mask, kv_cache = self.build_prefix_cache(observation)
+
+        noise = torch.randn_like(actions)
+        time = (
+            torch.distributions.Beta(torch.tensor(1.5), torch.tensor(1.0))
+            .sample((batch_size,))
+            .to(device=actions.device, dtype=torch.float32)
+            * 0.999
+            + 0.001
+        )
+        x_t = time[:, None, None] * noise + (1 - time[:, None, None]) * actions
+        suffix = self.run_suffix(observation, x_t, time, kv_cache, prefix_mask)
+        vla_loss = self._reduce_sft_loss(
+            (self.velocity_from_suffix(suffix) - (noise - actions)).square(),
+            use_action_chunk_loss,
+        )
+        result = {
+            "loss": vla_loss,
+            "vla_loss": vla_loss,
+            "sample_count": actions.new_tensor(batch_size),
+        }
+
+        if self.rlt_cfg.use_rlt:
+            selected, selected_mask = self._select_rlt_prefix_embeddings(
+                prefix, prefix_mask, observation.tokenized_prompt
+            )
+            rlt_loss, details = self._rlt_forward(selected, selected_mask)
+            mask = selected_mask if self.rlt_cfg.rlt_use_mask else None
+            valid_elements = (
+                mask.sum() * selected.shape[-1]
+                if mask is not None
+                else actions.new_tensor(selected.numel())
+            )
+            result.update(
+                loss=rlt_loss + self.rlt_cfg.rlt_alpha * vla_loss,
+                rlt_loss=rlt_loss,
+                rlt_valid_elements=valid_elements,
+            )
+            if token_shuffle:
+                tokens = details["z_rl"].reshape(batch_size, 1, -1).roll(1, dims=0)
+                with self._compute_autocast(selected.device):
+                    shuffled = self.rlt_module.decode(tokens, selected, mask)
+                error = (shuffled.float() - selected.float()).square()
+                if mask is not None:
+                    error = error * mask[..., None]
+                result["rlt_shuffle_loss"] = error.sum() / valid_elements.clamp_min(1)
+
+        sampled_actions = torch.randn_like(actions)
+        dt = -1.0 / num_steps
+        time_value = 1.0
+        for _ in range(num_steps):
+            sample_time = actions.new_full((batch_size,), time_value)
+            suffix = self.run_suffix(
+                observation, sampled_actions, sample_time, kv_cache, prefix_mask
+            )
+            sampled_actions = sampled_actions + dt * self.velocity_from_suffix(suffix)
+            time_value += dt
+        difference = sampled_actions - actions
+        result.update(
+            action_mae=self._reduce_sft_loss(difference.abs(), use_action_chunk_loss),
+            action_mse=self._reduce_sft_loss(
+                difference.square(), use_action_chunk_loss
+            ),
+            action_first_mae=self._reduce_sft_loss(difference[:, :1].abs(), False),
+        )
+        return result
 
     def freeze_vlm(self, freeze_action_expert: bool = False) -> int:
         """Freeze PaliGemma (vision + LLM expert-0). Optionally freeze expert-1.

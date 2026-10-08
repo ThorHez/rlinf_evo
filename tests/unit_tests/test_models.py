@@ -720,6 +720,168 @@ def test_openpi_sft_uses_umi_v4_augmentation(tiny_openpi_checkpoint, use_rlt):
     torch.testing.assert_close(captured[1], expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("compute_dtype", [None, "bf16"])
+@pytest.mark.parametrize("use_rlt", [False, True])
+def test_openpi_sft_eval_matches_flow_and_sampling_without_augmentation(
+    tiny_openpi_checkpoint, compute_dtype, use_rlt
+):
+    from rlinf.models.embodiment.base_policy import ForwardType
+    from rlinf.models.embodiment.openpi_rlinf.modules.model import Observation
+
+    model, (observation, actions) = tiny_openpi_checkpoint(
+        use_rlt=use_rlt,
+        compute_dtype=compute_dtype,
+        umi_v4_image_augmentation=True,
+        action_loss_mask=[1.0, 2.0, 0.0, 0.0],
+    )
+    _activate_tiny_openpi_trunk(model)
+    model.eval()
+    observation = Observation.from_dict(
+        torch.utils._pytree.tree_map(
+            lambda value: (
+                value.repeat_interleave(2, dim=0) if torch.is_tensor(value) else value
+            ),
+            observation.to_dict(),
+        )
+    )
+    observation.images["left_wrist_0_rgb"] = torch.linspace(
+        -1, 1, 2 * 224 * 224 * 3
+    ).reshape(2, 224, 224, 3)
+    observation.tokenized_prompt[1, 0] = 1
+    observation.tokenized_prompt_mask[1, -1] = False
+    actions = actions.repeat_interleave(2, dim=0)
+    seed = 123
+    torch.manual_seed(seed)
+    actual = model(
+        ForwardType.SFT,
+        data=(observation, actions),
+        evaluation=True,
+        eval_num_steps=2,
+    )
+    torch.manual_seed(seed)
+    with torch.no_grad():
+        expected_flow = model._reduce_sft_loss(
+            model.compute_loss(observation, actions, train=False), False
+        )
+        # The shared-prefix evaluator consumes the same flow noise and time
+        # draws as compute_loss, followed by the action-sampling noise.
+        sample_noise = torch.randn_like(actions)
+        sampled = model.sample_actions(observation, num_steps=2, noise=sample_noise)
+        error = sampled - actions
+        weights = error.new_tensor([1.0, 2.0, 0.0, 0.0])
+        expected_mse = ((error.square() * weights).sum(-1) / weights.sum()).mean()
+        expected_mae = ((error.abs() * weights).sum(-1) / weights.sum()).mean()
+    torch.testing.assert_close(actual["vla_loss"], expected_flow, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(actual["action_mse"], expected_mse, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(actual["action_mae"], expected_mae, rtol=1e-5, atol=1e-6)
+    assert actual["sample_count"].item() == 2
+    assert all(not value.requires_grad for value in actual.values())
+    assert all(parameter.grad is None for parameter in model.parameters())
+    if use_rlt:
+        torch.testing.assert_close(
+            actual["loss"], actual["rlt_loss"] + 0.5 * actual["vla_loss"]
+        )
+        assert actual["rlt_valid_elements"].item() > 0
+        assert actual["rlt_shuffle_loss"].isfinite()
+    else:
+        assert "rlt_loss" not in actual
+
+
+@pytest.mark.parametrize("compute_dtype", [None, "bf16"])
+def test_openpi_sft_probe_features_match_causal_prefix_and_image_control(
+    tiny_openpi_checkpoint, compute_dtype
+):
+    import dataclasses
+
+    from rlinf.models.embodiment.base_policy import ForwardType
+    from rlinf.models.embodiment.modules.rlt_token_transformer import RLTTokenEncoder
+    from rlinf.models.embodiment.openpi_rlinf.modules import model as observations
+    from rlinf.models.embodiment.openpi_rlinf.pi0 import make_attn_mask
+
+    policy, (observation, actions) = tiny_openpi_checkpoint(
+        use_rlt=True, compute_dtype=compute_dtype
+    )
+    _activate_tiny_openpi_trunk(policy)
+    policy.eval()
+    observation.images["left_wrist_0_rgb"] = torch.linspace(
+        -1, 1, 224 * 224 * 3
+    ).reshape(1, 224, 224, 3)
+    observation.image_masks["left_wrist_0_rgb"].fill_(True)
+    random_encoder = RLTTokenEncoder(
+        input_dim=64, embed_dim=16, prefix_seq_len=16, num_layers=1, num_heads=2
+    ).eval()
+    donor = dataclasses.replace(
+        observation,
+        images={
+            key: torch.ones_like(value) for key, value in observation.images.items()
+        },
+        state=observation.state + 100,
+        tokenized_prompt=(observation.tokenized_prompt + 1) % 32,
+    )
+    result = policy(
+        ForwardType.SFT,
+        data=observation,
+        feature_only=True,
+        random_encoder=random_encoder,
+        image_donor_observation=donor,
+    )
+    with torch.no_grad():
+        prepared = observations.preprocess_observation(observation, train=False)
+        prefix, prefix_mask, prefix_ar = policy.embed_prefix(prepared)
+        time_value = actions.new_full((len(actions),), 0.5)
+        suffix, suffix_mask, suffix_ar, cond = policy.embed_suffix(
+            prepared, actions + 10, time_value
+        )
+        mask = torch.cat([prefix_mask, suffix_mask], dim=1)
+        attention = make_attn_mask(mask, torch.cat([prefix_ar, suffix_ar]))
+        assert not attention[:, : prefix.shape[1], prefix.shape[1] :].any()
+        outputs, _ = policy.llm(
+            [prefix, suffix],
+            positions=mask.int().cumsum(1) - 1,
+            mask=attention,
+            adarms_cond=[None, cond],
+        )
+        selected, selected_mask = policy._select_rlt_prefix_embeddings(
+            outputs[0], prefix_mask, prepared.tokenized_prompt
+        )
+        expected = policy._encode_rlt_flat(selected, selected_mask).float()
+        with policy._compute_autocast(selected.device):
+            expected_random = (
+                random_encoder(selected.float(), selected_mask).flatten(1).float()
+            )
+        image_only = policy(
+            ForwardType.SFT,
+            data=dataclasses.replace(observation, images=donor.images),
+            feature_only=True,
+        )
+    torch.testing.assert_close(result["z"], expected)
+    torch.testing.assert_close(result["z_random"], expected_random)
+    torch.testing.assert_close(result["z_image_swapped"], image_only["z"])
+    assert not torch.equal(result["z"], result["z_image_swapped"])
+    assert all(not value.requires_grad for value in result.values())
+    assert all(parameter.grad is None for parameter in policy.parameters())
+
+
+def test_openpi_sft_eval_shuffle_requires_distinct_batch_positions(
+    tiny_openpi_checkpoint,
+):
+    from rlinf.models.embodiment.base_policy import ForwardType
+
+    model, batch = tiny_openpi_checkpoint(use_rlt=True)
+    model.eval()
+    with pytest.raises(ValueError, match="batch size >= 2"):
+        model(ForwardType.SFT, data=batch, evaluation=True)
+    output = model(
+        ForwardType.SFT,
+        data=batch,
+        evaluation=True,
+        eval_token_shuffle=False,
+        eval_num_steps=1,
+    )
+    assert "rlt_loss" in output
+    assert "rlt_shuffle_loss" not in output
+
+
 @pytest.mark.parametrize("use_rlt", [False, True])
 def test_openpi_sft_action_mask_excludes_padded_output_gradients(
     tiny_openpi_checkpoint, use_rlt

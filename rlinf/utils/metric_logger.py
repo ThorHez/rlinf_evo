@@ -48,8 +48,15 @@ def _import_summary_writer():
 
 
 class _TensorboardLogger:
-    def __init__(self, log_path):
-        self.writer = _import_summary_writer()(log_path)
+    def __init__(self, log_path, purge_step: int | None = None):
+        if purge_step is not None and (
+            isinstance(purge_step, bool)
+            or not isinstance(purge_step, int)
+            or purge_step < 0
+        ):
+            raise ValueError("tensorboard_purge_step must be a nonnegative integer.")
+        options = {} if purge_step is None else {"purge_step": purge_step}
+        self.writer = _import_summary_writer()(log_path, **options)
 
     def log(self, data: dict[str, float], step: int) -> None:
         for key, value in data.items():
@@ -147,7 +154,10 @@ class MetricLogger:
             config_yaml_path = os.path.join(tensorboard_log_path, "config.yaml")
             OmegaConf.save(self.cfg, config_yaml_path, resolve=True)
 
-            logger["tensorboard"] = _TensorboardLogger(tensorboard_log_path)
+            logger["tensorboard"] = _TensorboardLogger(
+                tensorboard_log_path,
+                purge_step=self.cfg.runner.logger.get("tensorboard_purge_step"),
+            )
         self._all_loggers.append(logger)
         return logger
 

@@ -42,6 +42,8 @@ override_cfg:
   camera_resolution: [1920, 1080]
   camera_fps: 30
   camera_pixel_format: MJPG
+  enable_camera_preview: false
+  camera_preview_port: 8765
   image_crop: null
   max_frame_age: 0.5
   max_state_gap: 0.05
@@ -51,5 +53,12 @@ override_cfg:
   enable_keyboard: true
   start_paused: true
   start_with_actor: false
+  return_on_episode_end: true
+  # Absolute service TCP XYZ + rotation vector (metres/radians).
+  reset_pose: ${oc.env:ARX_RESET_POSE,null}
+  reset_gripper_width: ${oc.decode:${oc.env:ARX_RESET_GRIPPER,0.085}}
+  reset_duration: 4.0
+  reset_frequency: 20.0
+  reset_settle_timeout: 2.0
   record_dir: ${runner.logger.log_path}/arx5_raw
   is_dummy: false

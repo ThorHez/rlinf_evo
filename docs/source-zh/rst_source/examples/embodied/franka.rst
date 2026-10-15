@@ -439,18 +439,31 @@ RLinf 启动 Franky 时，会尝试锁定控制进程的内存、以 ``SCHED_FIF
 
 ``single_stage`` 模式下，``a``、``b``、``c`` 分别输出失败、中性和成功奖励。``multi_stage`` 模式下，``a``、``b``、``c`` 用于切换奖励阶段，``q`` 输出负奖励。
 
-监听器直接读取 Linux 输入设备，因此机器人主机需要在启动 Ray 之前知道设备路径。先找到键盘对应的 event 设备：
+监听器默认读取机器人主机上所有可访问的 Linux 键盘事件设备，连接的任意键盘都可以标注奖励。在 SSH 终端输入字符不会产生这些设备事件。启动 Ray 前，清除旧的单设备选择，并授予运行用户读取已连接键盘的权限。在机器人主机的 Bash 中执行：
 
 .. code:: bash
 
-   ls -l /dev/input/by-id/*-event-kbd
+   unset RLINF_KEYBOARD_DEVICE
+   (
+   set -e
+   mapfile -t rlinf_keyboard_devices < <(
+     for rlinf_keyboard_link in \
+       /dev/input/by-id/*-event-kbd /dev/input/by-path/*-event-kbd; do
+       if [[ -e "$rlinf_keyboard_link" ]]; then
+         readlink -f "$rlinf_keyboard_link"
+       fi
+     done | sort -u
+   )
+   if (( ${#rlinf_keyboard_devices[@]} == 0 )); then
+     printf 'No keyboard event devices found. Check the physical connection.\n' >&2
+     exit 1
+   fi
+   sudo setfacl -m "u:$(id -un):r" "${rlinf_keyboard_devices[@]}"
+   )
 
-例如 ``usb-Logitech_USB_Keyboard-event-kbd -> ../event20`` 表示设备为 ``/dev/input/event20``。授予该设备的访问权限，并在执行 ``ray start`` 的终端中导出路径：
+命令解析 ``by-id`` 和 ``by-path`` 下的键盘链接，去重后为每个事件设备设置读取权限。监听器启动时至少需要一个可读取的键盘，运行中会定期扫描新接入且可读取的键盘；拔掉一个后，其余键盘仍可使用。新接入或重新插拔的键盘若无法读取，需要再次执行授权步骤。
 
-.. code:: bash
-
-   sudo chmod 666 /dev/input/event20
-   export RLINF_KEYBOARD_DEVICE=/dev/input/event20
+需要只监听一个键盘或脚踏时，可以在 ``ray start`` 前导出 ``RLINF_KEYBOARD_DEVICE=/dev/input/by-id/<device>-event-kbd``。Ray 会在启动时捕获环境变量，修改设备选择后需要重启 Ray。
 
 可视化与结果
 ------------

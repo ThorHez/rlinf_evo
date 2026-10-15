@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 import gymnasium as gym
 import numpy as np
+from scipy.spatial.transform import Rotation, Slerp
 
 from rlinf.algorithms.rlt.action_codec import EEFActionCodec
 from rlinf.envs.real.utils.config import get_hardware_config
@@ -30,6 +31,8 @@ if TYPE_CHECKING:
     from rlinf.robotics.parts.arms.arx5 import Arx5Arm, Arx5RobotState
     from rlinf.robotics.parts.cameras.base import BaseCamera
     from rlinf.scheduler import WorkerInfo
+
+    from .preview import Arx5CameraPreview
 
 StepResult = tuple[dict[str, Any], float, bool, bool, dict[str, Any]]
 
@@ -49,6 +52,8 @@ class Arx5RLTEnvConfig:
     camera_resolution: tuple[int, int] = (1920, 1080)
     camera_fps: int = 30
     camera_pixel_format: str = "MJPG"
+    enable_camera_preview: bool = False
+    camera_preview_port: int = 8765
     image_crop: list[int] | None = None
     max_frame_age: float = 0.5
     max_state_gap: float = 0.05
@@ -58,6 +63,12 @@ class Arx5RLTEnvConfig:
     enable_keyboard: bool = True
     start_paused: bool = True
     start_with_actor: bool = False
+    return_on_episode_end: bool = False
+    reset_pose: list[float] | str | None = None
+    reset_gripper_width: float | None = None
+    reset_duration: float = 4.0
+    reset_frequency: float = 20.0
+    reset_settle_timeout: float = 2.0
     record_dir: str | None = None
     is_dummy: bool = False
 
@@ -69,6 +80,9 @@ class Arx5RLTEnvConfig:
             "max_state_gap",
             "observation_timeout",
             "history_seconds",
+            "reset_duration",
+            "reset_frequency",
+            "reset_settle_timeout",
         ):
             value = float(getattr(self, name))
             setattr(self, name, value)
@@ -76,6 +90,9 @@ class Arx5RLTEnvConfig:
                 raise ValueError(f"{name} must be finite and positive.")
         self.camera_latency = float(self.camera_latency)
         self.camera_fps = int(self.camera_fps)
+        self.camera_preview_port = int(self.camera_preview_port)
+        if not 1 <= self.camera_preview_port <= 65535:
+            raise ValueError("camera_preview_port must be between 1 and 65535.")
         self.max_episode_steps = int(self.max_episode_steps)
         self.gripper_width_min = float(self.gripper_width_min)
         self.gripper_width_max = float(self.gripper_width_max)
@@ -94,6 +111,32 @@ class Arx5RLTEnvConfig:
             )
         if self.camera_fps <= 0 or self.max_episode_steps <= 0:
             raise ValueError("camera_fps and max_episode_steps must be positive.")
+        if isinstance(self.reset_pose, str):
+            try:
+                self.reset_pose = json.loads(self.reset_pose)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    "reset_pose must be a JSON array of TCP XYZ + rotvec."
+                ) from exc
+        if self.reset_pose is not None:
+            pose = np.asarray(self.reset_pose, dtype=np.float64)
+            if pose.shape != (6,) or not np.isfinite(pose).all():
+                raise ValueError("reset_pose must contain finite TCP XYZ + rotvec.")
+            self.reset_pose = pose.tolist()
+        elif self.return_on_episode_end:
+            raise ValueError(
+                "return_on_episode_end requires reset_pose in the service TCP frame; "
+                "set ARX_RESET_POSE for the ARX example configuration."
+            )
+        if self.reset_gripper_width is not None:
+            self.reset_gripper_width = float(self.reset_gripper_width)
+            if (
+                not np.isfinite(self.reset_gripper_width)
+                or not self.gripper_width_min
+                <= self.reset_gripper_width
+                <= self.gripper_width_max
+            ):
+                raise ValueError("reset_gripper_width must be within gripper limits.")
 
 
 class Arx5RLTEnv(gym.Env):
@@ -129,6 +172,10 @@ class Arx5RLTEnv(gym.Env):
         self._started = threading.Event()
         self._lock = threading.RLock()
         self._control_lock = threading.RLock()
+        self._return_cancel = threading.Event()
+        self._returning = False
+        self._episode_finished = False
+        self._pending_return: tuple[str, int | None] | None = None
         self._waiting_start = True
         self._frames = deque(
             maxlen=max(2, int(self.config.history_seconds * self.config.camera_fps))
@@ -137,6 +184,8 @@ class Arx5RLTEnv(gym.Env):
         self._listener = None
         self._threads: list[threading.Thread] = []
         self._episode_start = None
+        self._episode_id = 0
+        self._preview: Arx5CameraPreview | None = None
         self._published = None
         self._chunk = None
         self._chunk_index = 0
@@ -186,6 +235,15 @@ class Arx5RLTEnv(gym.Env):
                         "Use injected devices for ARX hardware-free tests."
                     )
                 self._connect(robot_info, worker_info, env_idx)
+            if self.config.enable_camera_preview:
+                try:
+                    from .preview import Arx5CameraPreview
+
+                    self._preview = Arx5CameraPreview(self.config.camera_preview_port)
+                except Exception as exc:
+                    self._logger.warning("ARX camera preview unavailable: %s", exc)
+                else:
+                    self._logger.info("ARX camera preview: %s", self._preview.url)
             if self.config.enable_keyboard:
                 from rlinf.envs.real.wrappers.episode.keyboard import KeyboardListener
 
@@ -279,6 +337,7 @@ class Arx5RLTEnv(gym.Env):
                 with self._lock:
                     self._frames.append((stamp - self.config.camera_latency, rgb, seq))
                 last_frame = stamp
+                self._publish_preview(frame)
             except queue.Empty:
                 if time.monotonic() - last_frame > self.config.max_frame_age:
                     self._background_error = TimeoutError(
@@ -291,6 +350,29 @@ class Arx5RLTEnv(gym.Env):
                 self._background_error = exc
                 self._hold_on_fault()
                 return
+
+    def _publish_preview(self, frame: np.ndarray) -> None:
+        if self._preview is None:
+            return
+        with self._lock:
+            episode = self._episode_id + int(self._waiting_start)
+            if self._background_error is not None:
+                status = "环境故障"
+            elif self._returning:
+                status = "回初始位置"
+            elif self._terminal_event == "abort":
+                status = "已中止"
+            elif self._waiting_start:
+                status = "等待开始（按 s）"
+            elif (
+                self._terminal
+                or self._episode_finished
+                or self._step_count >= self.config.max_episode_steps
+            ):
+                status = "本轮已结束"
+            else:
+                status = "进行中"
+        self._preview.publish(frame, episode=episode, status=status)
 
     def _keyboard_loop(self) -> None:
         last_press: dict[str, float] = {}
@@ -328,6 +410,20 @@ class Arx5RLTEnv(gym.Env):
 
     def _handle_operator_event(self, event: str) -> None:
         self._check_background()
+        if self.config.return_on_episode_end and (
+            self._returning or self._terminal or self._episode_finished
+        ):
+            if event in {"abort", "resume", "drag"}:
+                self._return_cancel.set()
+                state = self._arm.get_state()
+                if event == "drag":
+                    self._arm.enter_drag(expected_epoch=state.control_epoch)
+                elif state.mode in {"drag", "policy"}:
+                    self._arm.resume_hold(expected_epoch=state.control_epoch)
+                self._record("return_cancel", event=event)
+            else:
+                self._logger.info("Ignoring %s until the next episode reset.", event)
+            return
         if self._waiting_start and event == "abort":
             self._hold_on_fault()
             self._terminal_event = "abort"
@@ -387,18 +483,208 @@ class Arx5RLTEnv(gym.Env):
         if self._closed:
             raise RuntimeError("ARX environment is closed.")
 
-    def _hold_on_fault(self) -> None:
+    def _hold_on_fault(self) -> Arx5RobotState | None:
         """Best-effort measured hold; the SDK service independently faults too."""
         if self._arm is None:
             return
         try:
             state = self._arm.get_state()
             if state.mode == "drag":
-                self._arm.resume_hold(expected_epoch=state.control_epoch)
-            elif state.mode == "policy":
-                self._arm.hold(expected_epoch=state.control_epoch)
+                return self._arm.resume_hold(expected_epoch=state.control_epoch)
+            if state.mode == "policy":
+                return self._arm.hold(expected_epoch=state.control_epoch)
+            return state
         except Exception:
             self._logger.exception("Could not hold ARX after an environment failure.")
+            return None
+
+    def _return_control_changed(self, owner: Arx5RobotState) -> bool:
+        current = self._arm.get_state()
+        if current.mode == "fault":
+            raise RuntimeError(f"ARX service fault during return: {current.fault}")
+        changed = (
+            current.server_id != owner.server_id
+            or current.control_epoch != owner.control_epoch
+            or current.mode != owner.mode
+        )
+        if changed:
+            self._return_cancel.set()
+        return changed
+
+    def _return_waypoint(
+        self, pose: np.ndarray, gripper: float, owner: Arx5RobotState
+    ) -> Arx5RobotState | None:
+        with self._control_lock:
+            if self._stop.is_set() or self._return_cancel.is_set():
+                return None
+            self._check_background()
+            if self._return_control_changed(owner):
+                return None
+            try:
+                return self._arm.command_pose(
+                    pose, gripper, expected_epoch=owner.control_epoch
+                )
+            except Exception:
+                if self._return_control_changed(owner):
+                    # Another client may take control between the read and send.
+                    return None
+                raise
+
+    def _return_to_initial_pose(
+        self, *, server_id: str, control_epoch: int | None
+    ) -> None:
+        """Return after capturing the terminal transition, outside replay."""
+        if (
+            not self.config.return_on_episode_end
+            or self._terminal_event == "abort"
+            or self._return_cancel.is_set()
+        ):
+            return
+        target = np.asarray(self.config.reset_pose, dtype=np.float64)
+        target_rotation = Rotation.from_rotvec(target[3:])
+        target_pose = np.concatenate([target[:3], target_rotation.as_quat()])
+        owner = None
+        outcome = "failed"
+        failure_active = False
+        try:
+            with self._control_lock:
+                if self._stop.is_set() or self._return_cancel.is_set():
+                    outcome = "cancelled"
+                    return
+                self._check_background()
+                self._returning = True
+                current = self._arm.get_state()
+                if current.mode == "fault":
+                    raise RuntimeError(
+                        f"ARX service fault before return: {current.fault}"
+                    )
+                if (
+                    current.server_id != server_id
+                    or current.control_epoch != control_epoch
+                    or current.mode != "hold"
+                ):
+                    self._return_cancel.set()
+                    outcome = "cancelled"
+                    return
+                expected = current
+                try:
+                    held = self._arm.resume_hold(expected_epoch=expected.control_epoch)
+                    expected = held
+                    owner = self._arm.enable_policy(
+                        expected_epoch=expected.control_epoch
+                    )
+                except Exception:
+                    if self._return_control_changed(expected):
+                        outcome = "cancelled"
+                        return
+                    raise
+            start_pose = owner.tcp_pose.copy()
+            start_gripper = owner.gripper_width
+            target_gripper = (
+                start_gripper
+                if self.config.reset_gripper_width is None
+                else self.config.reset_gripper_width
+            )
+            rotations = Slerp(
+                [0.0, 1.0],
+                Rotation.from_quat([start_pose[3:], target_pose[3:]]),
+            )
+            steps = max(
+                2,
+                int(np.ceil(self.config.reset_duration * self.config.reset_frequency)),
+            )
+            interval = self.config.reset_duration / steps
+            self._logger.info(
+                "Returning to the configured initial pose over at least %.2f s.",
+                self.config.reset_duration,
+            )
+            self._record(
+                "return_start",
+                target_pose=target_pose,
+                target_gripper=target_gripper,
+                duration=self.config.reset_duration,
+            )
+            for index in range(1, steps + 1):
+                if self._return_cancel.wait(interval) or self._stop.is_set():
+                    outcome = "cancelled"
+                    return
+                progress = index / steps
+                blend = (
+                    2 * progress**2
+                    if progress < 0.5
+                    else 1 - (-2 * progress + 2) ** 2 / 2
+                )
+                pose = np.concatenate(
+                    [
+                        start_pose[:3] + blend * (target_pose[:3] - start_pose[:3]),
+                        rotations(blend).as_quat(),
+                    ]
+                )
+                gripper = start_gripper + blend * (target_gripper - start_gripper)
+                if self._return_waypoint(pose, gripper, owner) is None:
+                    outcome = "cancelled"
+                    return
+
+            # Keep the last waypoint active while the SDK's preview and motors
+            # catch up. Holding immediately would truncate the final movement.
+            deadline = time.monotonic() + self.config.reset_settle_timeout
+            while time.monotonic() < deadline:
+                state = self._return_waypoint(target_pose, target_gripper, owner)
+                if state is None:
+                    outcome = "cancelled"
+                    return
+                position_error = np.linalg.norm(state.tcp_pose[:3] - target_pose[:3])
+                rotation_error = (
+                    Rotation.from_quat(state.tcp_pose[3:]).inv() * target_rotation
+                ).magnitude()
+                if (
+                    position_error <= 0.005
+                    and rotation_error <= 0.05
+                    and abs(state.gripper_width - target_gripper) <= 0.005
+                ):
+                    outcome = "completed"
+                    return
+                if self._return_cancel.wait(interval) or self._stop.is_set():
+                    outcome = "cancelled"
+                    return
+            raise TimeoutError(
+                "ARX did not reach the initial pose before reset timeout."
+            )
+        except BaseException:
+            failure_active = True
+            raise
+        finally:
+            try:
+                with self._control_lock:
+                    if owner is not None and not self._closed:
+                        if self._return_control_changed(owner):
+                            if not failure_active:
+                                outcome = "cancelled"
+                        else:
+                            try:
+                                self._arm.hold(expected_epoch=owner.control_epoch)
+                            except Exception:
+                                if self._return_control_changed(owner):
+                                    if not failure_active:
+                                        outcome = "cancelled"
+                                else:
+                                    raise
+            except Exception:
+                outcome = "failed"
+                if not failure_active:
+                    failure_active = True
+                    raise
+                self._logger.exception("Could not hold ARX after a return failure.")
+            finally:
+                with self._control_lock:
+                    self._returning = False
+                try:
+                    self._record("return_end", outcome=outcome)
+                    self._logger.info("Return to initial pose: %s.", outcome)
+                except Exception:
+                    if not failure_active:
+                        raise
+                    self._logger.exception("Could not record the ARX return outcome.")
 
     def _observe(self, target_time: float | None = None) -> dict[str, Any]:
         deadline = time.monotonic() + self.config.observation_timeout
@@ -484,32 +770,41 @@ class Arx5RLTEnv(gym.Env):
     def reset(
         self, *, seed: int | None = None, options: dict[str, Any] | None = None
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Start an episode at the operator-established pose; never home implicitly."""
+        """Wait for the operator to start; automatic return belongs to episode end."""
         super().reset(seed=seed)
-        self._hold_on_fault()
-        self._episode_start = None
-        self._chunk = None
-        self._step_count = 0
-        self._terminal = False
-        self._reward = 0.0
-        self._terminal_target = None
-        self._terminal_reported = False
-        self._terminal_human = False
-        self._terminal_epoch = None
-        self._terminal_time = None
-        self._terminal_event = None
-        self._terminal_source_epoch = None
-        self._rlt_switch = self.config.start_with_actor
-        self._started.clear()
-        self._waiting_start = True
+        with self._control_lock:
+            # Preserve a drag takeover that cancelled the previous return.
+            if not (
+                self._return_cancel.is_set() and self._arm.get_state().mode == "drag"
+            ):
+                self._hold_on_fault()
+            self._return_cancel.clear()
+            self._episode_finished = False
+            self._pending_return = None
+            self._episode_start = None
+            self._chunk = None
+            self._step_count = 0
+            self._terminal = False
+            self._reward = 0.0
+            self._terminal_target = None
+            self._terminal_reported = False
+            self._terminal_human = False
+            self._terminal_epoch = None
+            self._terminal_time = None
+            self._terminal_event = None
+            self._terminal_source_epoch = None
+            self._rlt_switch = self.config.start_with_actor
+            self._started.clear()
+            self._waiting_start = True
         if not self.config.start_paused:
             self.handle_operator_event("start")
         while not self._started.wait(0.02):
             self._check_background()
-        self._waiting_start = False
         if self._terminal_event == "abort":
             raise InterruptedError("ARX episode aborted while waiting to start.")
         with self._lock:
+            self._episode_id += 1
+            self._waiting_start = False
             self._frames.clear()
         observation = self._observe()
         self._record("reset", anchor=self._published[1])
@@ -532,13 +827,23 @@ class Arx5RLTEnv(gym.Env):
     def step(self, action: np.ndarray) -> StepResult:
         """Execute one model target or encode one measured human action."""
         try:
-            return self._step(action)
+            result = self._step(action)
         except Exception:
             self._hold_on_fault()
             raise
+        if self._pending_return is not None:
+            server_id, control_epoch = self._pending_return
+            self._pending_return = None
+            # Return owns its cleanup; a new operator epoch must remain untouched.
+            self._return_to_initial_pose(
+                server_id=server_id, control_epoch=control_epoch
+            )
+        return result
 
     def _step(self, action: np.ndarray) -> StepResult:
         self._check_background()
+        if self._episode_finished:
+            raise RuntimeError("The ARX episode has ended; call reset before step.")
         if self._chunk is None:
             self.on_action_chunk_begin()
         stamp, anchor, epoch, server_id = self._chunk
@@ -678,8 +983,11 @@ class Arx5RLTEnv(gym.Env):
             and self._chunk_index >= self._chunk_size
             and not self._terminal
         )
+        return_epoch = self._terminal_epoch
         if truncated:
-            self._hold_on_fault()
+            with self._control_lock:
+                held = self._hold_on_fault()
+                return_epoch = None if held is None else held.control_epoch
         info["transition_valid"] = bool(valid)
         info["executed_action"] = np.asarray(actual, dtype=np.float32)
         info["control_epoch"] = state.control_epoch
@@ -705,6 +1013,13 @@ class Arx5RLTEnv(gym.Env):
             terminal=terminal,
             truncated=truncated,
         )
+        if (
+            self.config.return_on_episode_end
+            and (terminal or truncated)
+            and self._chunk_index >= self._chunk_size
+        ):
+            self._episode_finished = True
+            self._pending_return = (server_id, return_epoch)
         return observation, reward, terminal, truncated, info
 
     def close(self) -> None:
@@ -713,13 +1028,18 @@ class Arx5RLTEnv(gym.Env):
             return
         self._closed = True
         self._stop.set()
-        if self._listener is not None and hasattr(self._listener, "close"):
-            self._listener.close()
-        for thread in self._threads:
-            thread.join(timeout=1.0)
-        # An operator callback may already be inside an SDK request when close
-        # starts. Its final mode change must precede our final measured hold.
-        with self._control_lock:
-            self._hold_on_fault()
-            if self.robot is not None:
-                self.robot.disconnect()
+        self._return_cancel.set()
+        try:
+            if self._listener is not None and hasattr(self._listener, "close"):
+                self._listener.close()
+            for thread in self._threads:
+                thread.join(timeout=1.0)
+            # An operator callback may already be inside an SDK request when close
+            # starts. Its final mode change must precede our final measured hold.
+            with self._control_lock:
+                self._hold_on_fault()
+                if self.robot is not None:
+                    self.robot.disconnect()
+        finally:
+            if self._preview is not None:
+                self._preview.close()

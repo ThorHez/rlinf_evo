@@ -1,0 +1,13 @@
+{
+  "robot": {},
+  "controller": {},
+  "adapter": {},
+  "service": {
+    "command_timeout": 10.0
+  },
+  "limits": {
+    "translation": 0.05,
+    "rotation": 0.2,
+    "gripper": 0.02
+  }
+}

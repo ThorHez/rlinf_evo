@@ -6673,7 +6673,7 @@ fi
         assert "rlinf-openpi" not in result.stdout
 
 
-# ARX tests exercise the real JSON transport and SDK adapter with fake CAN/IK.
+# ARX tests exercise the real JSON transport and adapter with a fake SDK.
 @pytest.fixture(params=["ipc", "tcp"])
 def arx_service(tmp_path, request):
     import threading
@@ -6691,7 +6691,7 @@ def arx_service(tmp_path, request):
     service = Arx5Service(
         adapter,
         allow_motion=True,
-        limits=MotionLimits(translation=0.05, rotation=0.2, gripper=0.05, joint=0.3),
+        limits=MotionLimits(translation=0.05, rotation=0.2, gripper=0.05),
         sample_hz=200,
         history_seconds=0.5,
         command_timeout=0.2,
@@ -6799,9 +6799,7 @@ def test_arx_drag_invalidates_old_commands_and_restores_measured_target(arx_serv
         arm.disconnect()
 
 
-@pytest.mark.parametrize(
-    "failure", ["ik", "joint_limit", "translation", "rotation", "gripper", "expired"]
-)
+@pytest.mark.parametrize("failure", ["translation", "rotation", "gripper", "expired"])
 def test_arx_rejected_command_never_reaches_sdk(arx_service, failure):
     from rlinf.robotics.parts.arms import Arx5Arm
     from rlinf.robotics.parts.arms.arx5_protocol import Arx5Error
@@ -6812,19 +6810,14 @@ def test_arx_rejected_command_never_reaches_sdk(arx_service, failure):
         hold = arm.resume_hold()
         state = arm.enable_policy(hold.control_epoch)
         target, width, deadline = state.tcp_pose.copy(), state.gripper_width, None
-        if failure == "ik":
-            arx_service.solver.status = -5
-        elif failure == "joint_limit":
-            arx_service.solver.target_offset[0] = 4
-        elif failure == "translation":
+        if failure == "translation":
             target[0] += 0.1
         elif failure == "rotation":
             target[3:] = R.from_euler("z", 0.4).as_quat()
         elif failure == "gripper":
             width = 0.086
         else:
-            arx_service.solver.delay = 0.03
-            deadline = time.monotonic() + 0.01
+            deadline = time.monotonic() - 0.01
         count = arx_service.controller.command_count
         with pytest.raises(Arx5Error):
             arm.command_pose(target, width, state.control_epoch, deadline=deadline)
@@ -6949,7 +6942,6 @@ def test_arx_sdk_frame_and_gripper_calibration_roundtrip():
     adapter.command_pose(
         state["tcp_pose"],
         state["gripper_width"],
-        max_joint_step=0.1,
         deadline=time.monotonic() + 1,
     )
     np.testing.assert_allclose(
@@ -7004,6 +6996,46 @@ def test_arx_service_restart_and_read_only_mode_reject_motion():
     request["server_id"] = service.server_id
     assert service.handle(request)["error"]["code"] == "disabled"
     assert controller.command_count == 0
+
+
+@pytest.mark.parametrize(
+    "model_args", [["X5", "can0"], ["--model", "X5", "--interface", "can0"]]
+)
+def test_arx_cli_print_config_merges_defaults_without_loading_sdk(tmp_path, model_args):
+    import json
+
+    config = tmp_path / "overrides.json"
+    config.write_text(json.dumps({"service": {"command_timeout": 12.0}}))
+    missing_sdk = tmp_path / "no-sdk"
+    command = [
+        os.environ.get("ARX_SDK_PYTHON", sys.executable),
+        str(_ROOT / "toolkits/realworld_check/arx5_server.py"),
+        *model_args,
+        "--sdk-path",
+        str(missing_sdk),
+        "--config",
+        str(config),
+        "--allow-motion",
+        "--print-config",
+    ]
+    result = subprocess.run(
+        command, capture_output=True, text=True, timeout=10, check=True
+    )
+    resolved = json.loads(result.stdout)
+    assert (resolved["model"], resolved["interface"]) == ("X5", "can0")
+    assert resolved["sdk_path"] == str(missing_sdk)
+    assert resolved["config"]["service"]["command_timeout"] == 12.0
+    assert resolved["config"]["limits"] == {
+        "translation": 0.05,
+        "rotation": 0.2,
+        "gripper": 0.02,
+    }
+    assert resolved["config"]["controller"] == {}
+    config.write_text(json.dumps({"calibration_confirmed": False}))
+    rejected = subprocess.run(command, capture_output=True, text=True, timeout=10)
+    assert rejected.returncode != 0
+    assert "calibration_confirmed: false" in rejected.stderr
+    assert not missing_sdk.exists()
 
 
 def test_arx_cli_operator_process_uses_the_same_service(arx_service):
@@ -7118,7 +7150,7 @@ def test_arx_quantized_sdk_ticks_do_not_duplicate_history_or_relabel_old_samples
     )
     assert all(a <= b for a, b in zip(readings, readings[1:]))
     service = Arx5Service(
-        adapter, allow_motion=True, limits=MotionLimits(0.1, 0.2, 0.1, 0.3)
+        adapter, allow_motion=True, limits=MotionLimits(0.1, 0.2, 0.1)
     )
 
     def call(operation, **payload):

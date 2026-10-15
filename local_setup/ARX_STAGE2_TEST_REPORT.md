@@ -2,7 +2,26 @@
 
 本文记录本次新增功能的测试证据与尚未完成的硬件验证。纯函数和假设备验证不等同于机械臂运动验收。
 
-AC／TD3 共用适配完成后的本轮 CPU 回归：**622 通过、7 跳过、27 排除**，覆盖 Models、Utils、Data 和 Real environment 四份测试文件。下文保留初版 ARX 适配的独立历史记录；历史 Robotics 测试没有在本轮重复执行，不与本轮结果累加。
+最新提交前定向验证为 **186 项通过**，见下节。后文保留 2026-09-23 的 AC／TD3 共用适配回归（622 通过、7 跳过、27 排除）和初版 ARX 记录；不同轮次的结果不累加。
+
+## 真机采集流程提交前验证（2026-10-15）
+
+| 范围 | 通过 |
+| --- | ---: |
+| ARX 控制服务、协议与 CLI | 34 |
+| ARX 环境、回位、预览及键盘 | 44 |
+| ARX 训练数据、replay 和 AC／TD3 更新 | 57 |
+| AC／TD3 配置与必填参数 | 51 |
+
+本轮补充自动回位、中断回位后控制权保留、回位轨迹不写入 episode 动作、HTTP 只读预览、多键盘热插拔、仅训练 critic、replay 保存恢复及后台写盘错误传播测试。CLI 测试通过 Python 3.10 运行 `--print-config`，使用不存在的 SDK 路径证明配置预览不会加载 SDK 或连接设备；同时验证两种参数写法、默认配置合并及显式禁止运动的配置。
+
+配置回归发现 `oc.decode` 返回 Python list 后，当前 OmegaConf 的原地 resolve 会报 `UnsupportedValueType`，阻止设置 `ARX_RESET_POSE` 的正常启动。已改为保留环境变量字符串，在环境配置构造时解析 JSON，并验证六维、有限数值和缺失参数。直接提供列表仍受支持。
+
+上述测试均使用 CPU 和假设备。IPC／TCP 与 HTTP 测试最初受沙箱 socket 限制；经自动审批允许本机临时端口后通过。没有连接真实 CAN、相机，也没有进行真实运动或完整 GPU 训练。未运行的其余测试不计作通过。
+
+执行时使用 `env -u PYTHONPATH`、`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`、`CUDA_VISIBLE_DEVICES=''`、`JAX_PLATFORMS=cpu`，并将 OMP／OpenBLAS／MKL 线程数设为 1。选取范围为 `test_robotics.py` 中的 ARX 用例、`test_real_env.py` 中的 ARX／键盘用例、`test_data.py` 中的 ARX／replay 用例，以及 `test_utils.py` 中的 `arx_stage2` 用例。筛选结果按互不重叠的用例计数。
+
+RLinf 自有 Python 文件 Ruff lint／format、自有文件的 `git diff --check` 通过；四份 ARX／Franka 双语文档的 markup 和符号检查通过，双语完整 Sphinx 构建均零警告。SDK 保留来源、MIT 许可证和上游格式；整体 staged diff 检查会报告其中已有的行尾空白及 CRLF，未为消除这些提示重写第三方源码。上游运行库纳入版本，构建目录及生成的 Python 扩展保持忽略。约 16.4 GB 的本机模型目录不纳入代码提交。
 
 ## AC／TD3 共用适配回归（2026-09-23）
 

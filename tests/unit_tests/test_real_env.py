@@ -4541,7 +4541,7 @@ def test_robotwin_eval_success_seed_order_is_controlled_by_base_seed():
 
 
 @pytest.fixture
-def arx_env(tmp_path, monkeypatch):
+def arx_env(tmp_path, monkeypatch, request):
     """Real env, SDK adapter and control service; fake only CAN/IK and camera."""
     import json
 
@@ -4571,7 +4571,7 @@ def arx_env(tmp_path, monkeypatch):
     service = Arx5Service(
         SdkArx5Adapter(FakeArxSDK, controller, solver),
         allow_motion=True,
-        limits=MotionLimits(translation=0.05, rotation=0.2, gripper=0.05, joint=0.3),
+        limits=MotionLimits(translation=0.05, rotation=0.2, gripper=0.05),
         sample_hz=300,
         history_seconds=3,
         command_timeout=3,
@@ -4596,6 +4596,7 @@ def arx_env(tmp_path, monkeypatch):
             "observation_timeout": 0.15,
             "max_frame_age": 0.1,
             "record_dir": str(tmp_path / "records"),
+            **getattr(request, "param", {}),
         },
         arm=arm,
         camera=camera,
@@ -5175,3 +5176,206 @@ def test_arx_timeout_ends_drag_in_hold_and_routes_can_switch_both_ways(arx_env):
     transition = env.step(action)
     assert transition[3]
     assert arm.get_state().mode == "hold"
+
+
+@pytest.mark.parametrize(
+    "arx_env",
+    [
+        {
+            "return_on_episode_end": True,
+            "reset_pose": [0.27, 0.01, 0.36, 0.02, 0.01, -0.01],
+            "reset_gripper_width": 0.05,
+            "reset_duration": 0.12,
+            "reset_frequency": 50,
+            "reset_settle_timeout": 0.2,
+        }
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize("event", ["success", "failure", "timeout", "abort"])
+def test_arx_episode_returns_after_terminal_data_without_recording_reset_actions(
+    arx_env, event
+):
+    import json
+
+    from scipy.spatial.transform import Rotation
+
+    env, arm = arx_env.env, arx_env.arm
+    env.reset()
+    anchor = arm.get_state().tcp_pose.copy()
+    action = env.codec.encode_action(anchor, 0.04, anchor)
+    if event == "timeout":
+        env.config.max_episode_steps = 1
+    else:
+        env.handle_operator_event(event)
+    _, reward, done, truncated, info = env.step(action)
+    assert done == (event != "timeout")
+    assert truncated == (event == "timeout")
+    assert reward == {"success": 1, "failure": -1, "timeout": 0, "abort": 0}[event]
+    np.testing.assert_allclose(info["executed_action"], action, atol=1e-6)
+    state = arm.get_state()
+    assert state.mode == "hold"
+    records = [
+        json.loads(line)
+        for path in (arx_env.path / "records").glob("*.jsonl")
+        for line in path.read_text().splitlines()
+    ]
+    steps = [record for record in records if record["type"] == "step"]
+    assert len(steps) == 1
+    np.testing.assert_allclose(steps[0]["measured_pose"], anchor, atol=1e-6)
+    if event == "abort":
+        np.testing.assert_allclose(state.tcp_pose, anchor, atol=1e-6)
+        assert not any(record["type"] == "return_start" for record in records)
+    else:
+        np.testing.assert_allclose(state.tcp_pose[:3], env.config.reset_pose[:3])
+        np.testing.assert_allclose(
+            Rotation.from_quat(state.tcp_pose[3:]).as_matrix(),
+            Rotation.from_rotvec(env.config.reset_pose[3:]).as_matrix(),
+            atol=1e-6,
+        )
+        assert state.gripper_width == pytest.approx(0.05)
+        assert records[-1]["type"] == "return_end"
+        assert records[-1]["outcome"] == "completed"
+    with pytest.raises(RuntimeError, match="call reset before step"):
+        env.step(action)
+
+
+@pytest.mark.parametrize(
+    "arx_env",
+    [
+        {
+            "return_on_episode_end": True,
+            "reset_pose": [0.29, 0, 0.35, 0, 0, 0],
+            "reset_duration": 0.5,
+            "reset_frequency": 50,
+            "reset_settle_timeout": 0.2,
+        }
+    ],
+    indirect=True,
+)
+def test_arx_drag_cancels_return_without_reclaiming_control(arx_env):
+    env, arm = arx_env.env, arx_env.arm
+    env.reset()
+    anchor = arm.get_state().tcp_pose.copy()
+    action = env.codec.encode_action(anchor, 0.04, anchor)
+    env.handle_operator_event("success")
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        result = executor.submit(env.step, action)
+        deadline = time.monotonic() + 1
+        while arm.get_state().tcp_pose[0] <= anchor[0] + 0.001:
+            assert time.monotonic() < deadline, "Return movement never started"
+            time.sleep(0.005)
+        env.handle_operator_event("drag")
+        taken = arm.get_state()
+        assert taken.mode == "drag"
+        assert result.result(timeout=1)[2]
+    after = arm.get_state()
+    assert after.mode == "drag" and after.control_epoch == taken.control_epoch
+    np.testing.assert_allclose(after.tcp_pose, taken.tcp_pose)
+    count = arx_env.controller.command_count
+    time.sleep(0.04)
+    assert arx_env.controller.command_count == count
+
+
+def test_arx_camera_preview_serves_existing_frames_without_control_routes():
+    import http.client
+    import json
+    from urllib.parse import urlsplit
+
+    import cv2
+
+    from rlinf.envs.real.arx5.preview import Arx5CameraPreview
+
+    preview = Arx5CameraPreview(0)
+    address = urlsplit(preview.url)
+    client = http.client.HTTPConnection(address.hostname, address.port, timeout=2)
+    try:
+        client.request("GET", "/frame.jpg")
+        response = client.getresponse()
+        assert response.status == 503
+        response.read()
+        frame = np.full((40, 1000, 3), [20, 50, 100], dtype=np.uint8)
+        original = frame.copy()
+        preview.publish(frame, episode=7, status="等待开始")
+        client.request("GET", "/frame.jpg")
+        response = client.getresponse()
+        assert response.status == 200
+        assert response.getheader("Cache-Control") == "no-store"
+        metadata = json.loads(response.getheader("X-Preview-Metadata"))
+        assert metadata["episode"] == 7 and metadata["status"] == "等待开始"
+        assert metadata["age_seconds"] >= 0
+        decoded = cv2.imdecode(
+            np.frombuffer(response.read(), np.uint8), cv2.IMREAD_COLOR
+        )
+        assert decoded.shape == (38, 960, 3)
+        np.testing.assert_allclose(decoded[0, 0], frame[0, 0], atol=2)
+        np.testing.assert_array_equal(frame, original)
+        client.request("POST", "/reset", body=b"")
+        response = client.getresponse()
+        assert response.status == 501
+        response.read()
+    finally:
+        client.close()
+        preview.close()
+
+
+def test_keyboard_listener_combines_devices_and_accepts_hotplug(monkeypatch):
+    import errno
+    from collections import deque
+
+    from robot_mocks.teleop import keyboard
+
+    from rlinf.envs.real.wrappers.episode.keyboard import KeyboardListener
+
+    module = keyboard()
+    queues = {path: deque() for path in ("/fake/a", "/fake/b", "/fake/c")}
+    connected = {"/fake/a", "/fake/b"}
+    opened = []
+    original = module.InputDevice
+
+    class Device(original):
+        def __init__(self, path):
+            super().__init__(path)
+            opened.append(self)
+
+        def read(self):
+            if self.path not in connected:
+                raise OSError(errno.ENODEV, "unplugged")
+            if not queues[self.path]:
+                raise BlockingIOError()
+            return [queues[self.path].popleft()]
+
+    def wait_for(condition):
+        deadline = time.monotonic() + 2
+        while not condition():
+            assert time.monotonic() < deadline, "Keyboard state did not update"
+            time.sleep(0.005)
+
+    def event(path, code, value):
+        queues[path].append(
+            SimpleNamespace(type=module.ecodes.EV_KEY, code=code, value=value)
+        )
+
+    module.InputDevice = Device
+    module.list_devices = lambda: list(connected)
+    monkeypatch.setitem(sys.modules, "evdev", module)
+    monkeypatch.delenv("RLINF_KEYBOARD_DEVICE", raising=False)
+    listener = KeyboardListener()
+    try:
+        event("/fake/a", module.ecodes.KEY_B, 1)
+        wait_for(lambda: listener.get_key() == "b")
+        event("/fake/b", module.ecodes.KEY_C, 1)
+        wait_for(lambda: listener.get_key() == "c")
+        event("/fake/b", module.ecodes.KEY_C, 0)
+        wait_for(lambda: listener.get_key() == "b")
+        assert listener.pop_pressed_keys() == ["b", "c"]
+        connected.remove("/fake/a")
+        wait_for(lambda: listener.get_key() is None)
+        connected.add("/fake/c")
+        event("/fake/c", module.ecodes.KEY_Q, 1)
+        wait_for(lambda: listener.get_key() == "q")
+        assert listener.pop_pressed_keys() == ["q"]
+        assert listener.error is None
+    finally:
+        listener.close()
+    assert all(device.closed for device in opened)

@@ -3442,6 +3442,114 @@ def test_arx_replay_drops_entirely_invalid_chunks(arx_replay_ingestion):
     assert arx_replay_ingestion.demo_buffer.size == 0
 
 
+def _checkpoint_replay_trajectory(identity, length):
+    values = torch.arange(length, dtype=torch.float32).reshape(length, 1, 1)
+    values += identity
+    terminal = torch.zeros(length, 1, 1, dtype=torch.bool)
+    terminal[-1] = True
+    return Trajectory(
+        model_weights_id="snapshot",
+        actions=values.expand(length, 1, 2).clone(),
+        rewards=values + 0.5,
+        dones=terminal,
+        terminations=terminal.clone(),
+        truncations=torch.zeros_like(terminal),
+        curr_obs={"states": values.clone()},
+        next_obs={"states": values + 100},
+    )
+
+
+@pytest.mark.parametrize("auto_save", [False, True])
+def test_replay_checkpoint_roundtrip_has_matching_files_index_and_samples(
+    tmp_path, auto_save
+):
+    from rlinf.data.storage.replay.buffer import TrajectoryReplayBuffer
+
+    source = TrajectoryReplayBuffer(
+        auto_save=auto_save,
+        auto_save_path=str(tmp_path / "live"),
+        enable_cache=False,
+        sample_window_size=2,
+    )
+    restored = TrajectoryReplayBuffer(sample_window_size=1)
+    copied = TrajectoryReplayBuffer(sample_window_size=10)
+    snapshot = tmp_path / "snapshot"
+    second_snapshot = tmp_path / "second_snapshot"
+    try:
+        source.add_trajectories(
+            [_checkpoint_replay_trajectory(10 * size, size) for size in (1, 2, 3)]
+        )
+        # No sampling precedes checkpointing: saving must not depend on the
+        # lazily populated sampling window. Memory-only storage forces a cache.
+        source.save_checkpoint(str(snapshot))
+        expected_ids = [0, 1, 2] if auto_save else [1, 2]
+        expected_values = {20.0, 21.0, 30.0, 31.0, 32.0}
+        if auto_save:
+            expected_values.add(10.0)
+        metadata = json.loads((snapshot / "metadata.json").read_text())
+        index = json.loads((snapshot / "trajectory_index.json").read_text())
+        assert index["trajectory_id_list"] == expected_ids
+        assert set(index["trajectory_index"]) == set(map(str, expected_ids))
+        assert metadata["size"] == len(expected_ids)
+        assert metadata["total_samples"] == len(expected_values)
+        assert metadata["trajectory_counter"] == 3
+        assert {path.name for path in snapshot.glob("trajectory_*.pt")} == {
+            f"trajectory_{identity}_snapshot.pt" for identity in expected_ids
+        }
+        for identity in expected_ids:
+            saved = torch.load(
+                snapshot / f"trajectory_{identity}_snapshot.pt", map_location="cpu"
+            )
+            torch.testing.assert_close(
+                saved["rewards"], saved["actions"][..., :1] + 0.5
+            )
+            assert (
+                saved["rewards"].numel()
+                == index["trajectory_index"][str(identity)]["num_samples"]
+            )
+
+        restored.load_checkpoint(str(snapshot))
+        # The restored cache retains one trajectory, but a new checkpoint must
+        # also copy the other trajectories backed by files from the first one.
+        restored.save_checkpoint(str(second_snapshot))
+        snapshot.rename(tmp_path / "unavailable_snapshot")
+        copied.load_checkpoint(str(second_snapshot))
+        assert copied.size == len(expected_ids)
+        assert copied.total_samples == len(expected_values)
+        batch = _sample_arx_replay(copied)
+        actions = batch["actions"][:, :1]
+        assert set(actions.flatten().tolist()) == expected_values
+        torch.testing.assert_close(batch["rewards"], actions + 0.5)
+        torch.testing.assert_close(batch["curr_obs"]["states"], actions)
+        torch.testing.assert_close(batch["next_obs"]["states"], actions + 100)
+        torch.testing.assert_close(
+            batch["dones"], (actions == 10) | (actions == 21) | (actions == 32)
+        )
+    finally:
+        for buffer in (source, restored, copied):
+            buffer.close()
+
+
+def test_replay_checkpoint_propagates_background_write_failure(tmp_path):
+    from rlinf.data.storage.replay.buffer import TrajectoryReplayBuffer
+
+    live = tmp_path / "live"
+    # A directory where the trajectory file belongs produces a real filesystem
+    # write failure in the background executor, without replacing storage code.
+    (live / "trajectory_0_snapshot.pt").mkdir(parents=True)
+    buffer = TrajectoryReplayBuffer(auto_save=True, auto_save_path=str(live))
+    snapshot = tmp_path / "snapshot"
+    try:
+        buffer.add_trajectories([_checkpoint_replay_trajectory(10, 1)])
+        with pytest.raises((OSError, RuntimeError), match="directory"):
+            buffer.save_checkpoint(str(snapshot))
+        assert not (snapshot / "metadata.json").exists()
+        assert not (snapshot / "trajectory_index.json").exists()
+    finally:
+        with pytest.raises((OSError, RuntimeError), match="directory"):
+            buffer.close()
+
+
 def test_arx_human_bc_learns_correction_without_reference_target_leakage():
     from rlinf.models.embodiment.mlp_policy.rlt_mlp_policy import RLTMLPPolicy
     from rlinf.workers.actor.fsdp_rlt_ac_policy_worker import RLTACLossMixin
@@ -3808,6 +3916,7 @@ def test_arx_rlt_production_update_delays_actor_and_updates_target(arx_rlt_cpu_l
     }
     learner.update_step = 1
     skipped = learner.update_one_epoch()
+    assert skipped["actor/updated"] == 0.0
     assert "sac/actor_loss" not in skipped
     assert "sac/critic_loss" in skipped
     assert any(
@@ -3823,6 +3932,7 @@ def test_arx_rlt_production_update_delays_actor_and_updates_target(arx_rlt_cpu_l
 
     learner.update_step = 2
     updated = learner.update_one_epoch()
+    assert updated["actor/updated"] == 1.0
     assert "sac/actor_loss" in updated
     assert all(np.isfinite(float(value)) for value in updated.values())
     assert any(
@@ -3836,6 +3946,48 @@ def test_arx_rlt_production_update_delays_actor_and_updates_target(arx_rlt_cpu_l
             parameter, 0.75 * target_before[name] + 0.25 * online[name]
         )
         assert parameter.grad is None
+
+
+def test_arx_rlt_train_actor_false_updates_only_critic(arx_rlt_cpu_learner):
+    from rlinf.models.embodiment.modules.entropy_tunning import EntropyTemperature
+
+    learner = arx_rlt_cpu_learner
+    _arx_rlt_training_rollout(learner)
+    learner.cfg.algorithm.train_actor = False
+    learner.update_step = 2  # This is otherwise an actor-update iteration.
+    learner.entropy_temp = EntropyTemperature(initial_alpha=0.1, device="cpu")
+    learner.alpha_optimizer = torch.optim.Adam(
+        learner.entropy_temp.parameters(), lr=0.01
+    )
+    learner.alpha_lr_scheduler = torch.optim.lr_scheduler.ConstantLR(
+        learner.alpha_optimizer, factor=1.0
+    )
+    before = {
+        name: value.detach().clone() for name, value in learner.model.named_parameters()
+    }
+    alpha_before = learner.entropy_temp.base_alpha.detach().clone()
+    actor_scheduler_before = copy.deepcopy(learner.lr_scheduler.state_dict())
+    alpha_scheduler_before = copy.deepcopy(learner.alpha_lr_scheduler.state_dict())
+    metrics = learner.update_one_epoch(train_actor=True)
+    assert metrics["actor/updated"] == 0.0
+    assert "sac/actor_loss" not in metrics and "sac/alpha_loss" not in metrics
+    assert np.isfinite(metrics["sac/critic_loss"])
+    assert any(
+        not torch.equal(parameter, before[name])
+        for name, parameter in learner.model.named_parameters()
+        if "q_head" in name
+    )
+    for name, parameter in learner.model.named_parameters():
+        if "q_head" not in name:
+            torch.testing.assert_close(parameter, before[name], rtol=0, atol=0)
+            assert parameter.grad is None
+    torch.testing.assert_close(
+        learner.entropy_temp.base_alpha, alpha_before, rtol=0, atol=0
+    )
+    assert learner.entropy_temp.base_alpha.grad is None
+    assert not learner.optimizer.state and not learner.alpha_optimizer.state
+    assert learner.lr_scheduler.state_dict() == actor_scheduler_before
+    assert learner.alpha_lr_scheduler.state_dict() == alpha_scheduler_before
 
 
 @pytest.mark.parametrize("algorithm", ["ac", "td3"])

@@ -919,7 +919,10 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
         critic_updates_run = 0
         actor_updates_run = 0
         for _ in range(updates_to_run):
-            update_actor = int(self.update_step) % int(self.critic_actor_ratio) == 0
+            update_actor = (
+                self.cfg.algorithm.get("train_actor", True)
+                and int(self.update_step) % int(self.critic_actor_ratio) == 0
+            )
             metrics_data = self.update_one_epoch(train_actor=update_actor)
             append_to_dict(metrics, metrics_data)
             self.update_step += 1
@@ -1034,7 +1037,10 @@ class AsyncRLTACFSDPPolicy(
         critic_updates_run = 0
         actor_updates_run = 0
         for _ in range(updates_to_run):
-            update_actor = int(self.update_step) % int(self.critic_actor_ratio) == 0
+            update_actor = (
+                self.cfg.algorithm.get("train_actor", True)
+                and int(self.update_step) % int(self.critic_actor_ratio) == 0
+            )
             await asyncio.sleep(0)
             metrics_data = self.update_one_epoch(train_actor=update_actor)
             append_to_dict(metrics, metrics_data)

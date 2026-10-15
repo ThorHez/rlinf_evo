@@ -19,7 +19,7 @@ import os
 import pickle as pkl
 import shutil
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from typing import Optional
 
 import numpy as np
@@ -299,7 +299,7 @@ class TrajectoryReplayBuffer:
 
         # Flattened trajectory cache for fast sampling
         self._flat_trajectory_cache = (
-            TrajectoryCache(cache_size) if enable_cache else None
+            TrajectoryCache(cache_size) if self.enable_cache else None
         )
 
         # Async save executor for add_trajectories
@@ -307,6 +307,10 @@ class TrajectoryReplayBuffer:
         # Separate executor for checkpoint saves
         self._checkpoint_executor = ThreadPoolExecutor(max_workers=20)
         self._index_lock = threading.Lock()
+        # Background writers only acquire _index_lock, so they can finish while
+        # a checkpoint holds this lock to prevent cache eviction and ID reuse.
+        self._mutation_lock = threading.RLock()
+        self._pending_save_futures: list[Future] = []
 
         # Cached window metadata for faster sampling
         self._window_cache_size = None
@@ -438,7 +442,7 @@ class TrajectoryReplayBuffer:
 
         return trajectory
 
-    def add_trajectories(self, trajectories: list[Trajectory]):
+    def add_trajectories(self, trajectories: list[Trajectory]) -> None:
         """
         Add trajectories to the buffer.
         Each trajectory is directly stored as-is (shape: [T, B, ...]).
@@ -450,6 +454,11 @@ class TrajectoryReplayBuffer:
         if not trajectories:
             return
 
+        with self._mutation_lock:
+            self._wait_for_pending_saves(wait=False)
+            self._add_trajectories(trajectories)
+
+    def _add_trajectories(self, trajectories: list[Trajectory]) -> None:
         save_futures = []
         for trajectory in trajectories:
             model_weights_id = trajectory.model_weights_id
@@ -470,14 +479,14 @@ class TrajectoryReplayBuffer:
             # Save trajectory to disk if enabled
             if self.auto_save:
                 # Save asynchronously to reduce I/O stalls
-                save_futures.append(
-                    self._save_executor.submit(
-                        self._save_trajectory,
-                        trajectory,
-                        trajectory_id,
-                        model_weights_id,
-                    )
+                future = self._save_executor.submit(
+                    self._save_trajectory,
+                    trajectory,
+                    trajectory_id,
+                    model_weights_id,
                 )
+                save_futures.append(future)
+                self._pending_save_futures.append(future)
                 self._trajectory_file_path[trajectory_id] = self.auto_save_path
 
             # Add to index
@@ -513,7 +522,19 @@ class TrajectoryReplayBuffer:
                 self._save_metadata()
                 self._save_trajectory_index()
 
-            self._save_executor.submit(_flush_metadata)
+            self._pending_save_futures.append(
+                self._save_executor.submit(_flush_metadata)
+            )
+
+    def _wait_for_pending_saves(self, *, wait: bool = True) -> None:
+        """Propagate background write errors while holding _mutation_lock."""
+        pending = []
+        for future in self._pending_save_futures:
+            if wait or future.done():
+                future.result()
+            else:
+                pending.append(future)
+        self._pending_save_futures = pending
 
     def _reshape_flat_for_save(self, value: object, T: int, B: int) -> object:
         if isinstance(value, torch.Tensor):
@@ -527,12 +548,16 @@ class TrajectoryReplayBuffer:
             }
         return value
 
-    def close(self, wait: bool = True):
-        """Flush and shutdown async save executor."""
-        if self._save_executor is not None:
-            self._save_executor.shutdown(wait=wait)
-        if self._checkpoint_executor is not None:
-            self._checkpoint_executor.shutdown(wait=wait)
+    def close(self, wait: bool = True) -> None:
+        """Shut down writers and, when waiting, propagate pending write errors."""
+        with self._mutation_lock:
+            try:
+                self._wait_for_pending_saves(wait=wait)
+            finally:
+                if self._save_executor is not None:
+                    self._save_executor.shutdown(wait=wait)
+                if self._checkpoint_executor is not None:
+                    self._checkpoint_executor.shutdown(wait=wait)
 
     def sample(
         self,
@@ -898,20 +923,22 @@ class TrajectoryReplayBuffer:
         """Check if buffer has enough samples for training."""
         return self.size >= min_size
 
-    def clear(self):
-        # Clear index
-        self._trajectory_index.clear()
-        self._trajectory_id_list.clear()
-        self._trajectory_file_path.clear()
+    def clear(self) -> None:
+        """Wait for pending writes before clearing the index and cached data."""
+        with self._mutation_lock:
+            self._wait_for_pending_saves()
+            with self._index_lock:
+                self._trajectory_index.clear()
+                self._trajectory_id_list.clear()
+                self._trajectory_file_path.clear()
+                self._index_version += 1
 
-        # Clear cache
-        if self._flat_trajectory_cache is not None:
-            self._flat_trajectory_cache.clear()
+                if self._flat_trajectory_cache is not None:
+                    self._flat_trajectory_cache.clear()
 
-        # Reset state
-        self.size = 0
-        self._total_samples = 0
-        self._trajectory_counter = 0
+                self.size = 0
+                self._total_samples = 0
+                self._trajectory_counter = 0
 
     def get_stats(self) -> dict[str, float]:
         """Get buffer statistics."""
@@ -924,31 +951,87 @@ class TrajectoryReplayBuffer:
         }
         return stats
 
-    def save_checkpoint(self, save_path: str):
-        """
-        Save buffer state (metadata and indices) to save_path.
-        """
-        # Create save directory
-        os.makedirs(save_path, exist_ok=True)
+    def save_checkpoint(self, save_path: str) -> None:
+        """Save a self-contained replay snapshot, waiting for pending writes.
 
+        With auto-save enabled, every indexed trajectory is included. Otherwise,
+        only trajectories retained in memory or backed by loaded files are saved.
+        Metadata describes exactly the saved trajectories. Missing source files
+        and background write errors fail the save before new metadata is written.
+        """
+        with self._mutation_lock:
+            self._wait_for_pending_saves()
+            self._save_checkpoint(save_path)
+
+    def _save_checkpoint(self, save_path: str) -> None:
+        os.makedirs(save_path, exist_ok=True)
+        cache = self._flat_trajectory_cache
+        with self._index_lock:
+            trajectory_ids = [
+                trajectory_id
+                for trajectory_id in self._trajectory_id_list
+                if self.auto_save
+                or trajectory_id in self._trajectory_file_path
+                or (cache is not None and trajectory_id in cache.cache)
+            ]
+            trajectory_index = {
+                trajectory_id: copy.deepcopy(self._trajectory_index[trajectory_id])
+                for trajectory_id in trajectory_ids
+            }
+            source_paths = dict(self._trajectory_file_path)
+            metadata = {
+                "trajectory_format": self.trajectory_format,
+                "size": len(trajectory_ids),
+                "total_samples": sum(
+                    info["num_samples"] for info in trajectory_index.values()
+                ),
+                "trajectory_counter": self._trajectory_counter,
+                "seed": self.seed,
+            }
+
+        # Keep the cache stable until every writer has finished, including when
+        # one copy fails. The mutation lock prevents add/load/clear during this.
         save_futures = []
-        if not self.auto_save:
-            cache = self._flat_trajectory_cache
-            if cache is None:
-                raise RuntimeError("auto_save=False requires cache to save checkpoint.")
-            cached_ids = list(cache.cache.keys())
-            for trajectory_id in cached_ids:
-                flat = cache.get(trajectory_id)
+        try:
+            for trajectory_id, info in trajectory_index.items():
+                model_weights_id = info["model_weights_id"]
+                source_dir = source_paths.get(trajectory_id)
+                if source_dir is not None:
+                    source_path = self._get_trajectory_path(
+                        trajectory_id, model_weights_id, base_dir=source_dir
+                    )
+                    if not os.path.isfile(source_path):
+                        raise FileNotFoundError(
+                            f"Cannot checkpoint trajectory {trajectory_id}: "
+                            f"source file is missing: {source_path}"
+                        )
+                    target_path = self._get_trajectory_path(
+                        trajectory_id, model_weights_id, base_dir=save_path
+                    )
+                    if os.path.exists(target_path) and os.path.samefile(
+                        source_path, target_path
+                    ):
+                        continue
+                    save_futures.append(
+                        self._checkpoint_executor.submit(
+                            shutil.copyfile, source_path, target_path
+                        )
+                    )
+                    continue
+
+                flat = cache.get(trajectory_id) if cache is not None else None
                 if flat is None:
-                    continue
-                info = self._trajectory_index.get(trajectory_id, None)
-                if info is None:
-                    continue
+                    raise RuntimeError(
+                        f"Cannot checkpoint trajectory {trajectory_id}: "
+                        "no source file or cached data is available."
+                    )
                 shape = info.get("shape", None)
                 if not shape or len(shape) < 2:
-                    continue
+                    raise ValueError(
+                        f"Cannot checkpoint trajectory {trajectory_id}: "
+                        f"invalid trajectory shape {shape!r}."
+                    )
                 T, B = shape[:2]
-                model_weights_id = info.get("model_weights_id", "")
                 trajectory = Trajectory(
                     max_episode_length=info.get("max_episode_length", 0),
                     model_weights_id=model_weights_id,
@@ -969,31 +1052,23 @@ class TrajectoryReplayBuffer:
                         save_dir=save_path,
                     )
                 )
-        else:
-            for trajectory_id in self._window_cache_ids:
-                model_weights_id = self._trajectory_index[trajectory_id][
-                    "model_weights_id"
-                ]
-                trajectory_path = self._get_trajectory_path(
-                    trajectory_id, model_weights_id
-                )
-                if not os.path.isfile(trajectory_path):
-                    continue
 
-                # copy trajectory file from trajectory_path to save_path
-                target_path = os.path.join(save_path, os.path.basename(trajectory_path))
-                save_futures.append(
-                    self._checkpoint_executor.submit(
-                        shutil.copyfile, trajectory_path, target_path
-                    )
-                )
+            for future in save_futures:
+                future.result()
+        finally:
+            # Wait without replacing the original exception if any writer fails.
+            wait(save_futures)
 
-        for fut in save_futures:
-            fut.result()
-
-        # Save metadata and trajectory index into the specified directory
-        self._save_metadata(save_path)
-        self._save_trajectory_index(save_path)
+        with open(self._get_trajectory_index_path(save_path), "w") as f:
+            json.dump(
+                {
+                    "trajectory_index": trajectory_index,
+                    "trajectory_id_list": trajectory_ids,
+                },
+                f,
+            )
+        with open(self._get_metadata_path(save_path), "w") as f:
+            json.dump(metadata, f)
 
     def load_checkpoint(
         self,
@@ -1001,7 +1076,7 @@ class TrajectoryReplayBuffer:
         is_distributed: bool = False,
         local_rank: int = 0,
         world_size: int = 1,
-    ):
+    ) -> None:
         """
         Load buffer state from saved metadata.
 
@@ -1011,6 +1086,25 @@ class TrajectoryReplayBuffer:
             local_rank: Rank index (0-based) for partial loading. Only used when is_distributed=True
             world_size: Total number of ranks. Only used when is_distributed=True
         """
+        with self._mutation_lock:
+            self._wait_for_pending_saves()
+            self._load_checkpoint(load_path, is_distributed, local_rank, world_size)
+
+    def _load_checkpoint(
+        self,
+        load_path: str,
+        is_distributed: bool,
+        local_rank: int,
+        world_size: int,
+    ) -> None:
+        if is_distributed:
+            if world_size <= 0:
+                raise ValueError(f"world_size ({world_size}) must be > 0")
+            if local_rank < 0 or local_rank >= world_size:
+                raise ValueError(
+                    f"local_rank ({local_rank}) must be in range [0, {world_size})"
+                )
+
         metadata_path = os.path.join(load_path, "metadata.json")
         if not os.path.exists(metadata_path):
             raise FileNotFoundError(f"Metadata not found at {metadata_path}")
@@ -1041,16 +1135,11 @@ class TrajectoryReplayBuffer:
         full_trajectory_id_list = [
             int(k) for k in index_data.get("trajectory_id_list", [])
         ]
+        self._trajectory_file_path.clear()
+        self._index_version += 1
 
         # Handle distributed loading
         if is_distributed:
-            if local_rank < 0 or local_rank >= world_size:
-                raise ValueError(
-                    f"local_rank ({local_rank}) must be in range [0, {world_size})"
-                )
-            if world_size <= 0:
-                raise ValueError(f"world_size ({world_size}) must be > 0")
-
             # Split trajectory_uuid_list into world_size parts
             total_trajectories = len(full_trajectory_id_list)
             trajectories_per_split = total_trajectories // world_size
@@ -1121,9 +1210,10 @@ class TrajectoryReplayBuffer:
 
     def clear_cache(self):
         """Clear trajectory cache."""
-        self.close()
-        if self._flat_trajectory_cache is not None:
-            self._flat_trajectory_cache.clear()
+        with self._mutation_lock:
+            self.close()
+            if self._flat_trajectory_cache is not None:
+                self._flat_trajectory_cache.clear()
 
 
 class PriorityStore:

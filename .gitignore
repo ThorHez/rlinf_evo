@@ -22,3 +22,13 @@ rlinf/envs/sim/maniskill/assets
 PKG-INFO
 *.egg-info/
 .claude/settings.json
+
+# Local model checkpoints and normalization assets.
+/models/
+
+# Keep the pinned SDK's build files and upstream runtime libraries.
+!third_party/arx5-sdk/**/*.txt
+!third_party/arx5-sdk/lib/**/*.so
+!third_party/arx5-sdk/wheels/lib/**/*.so
+!third_party/arx5-sdk/.vscode/
+!third_party/arx5-sdk/.vscode/**

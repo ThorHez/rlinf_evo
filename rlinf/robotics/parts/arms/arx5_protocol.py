@@ -210,17 +210,16 @@ class Arx5Client:
 
 @dataclass(frozen=True)
 class MotionLimits:
-    """Explicit per-command limits, independently measured in m and rad."""
+    """Per-command Cartesian translation, rotation, and gripper limits."""
 
     translation: float
     rotation: float
     gripper: float
-    joint: float
 
     def __post_init__(self) -> None:
         if not all(
             math.isfinite(v) and v > 0
-            for v in (self.translation, self.rotation, self.gripper, self.joint)
+            for v in (self.translation, self.rotation, self.gripper)
         ):
             raise ValueError("All motion limits must be finite and positive")
 
@@ -439,11 +438,9 @@ class Arx5Service:
                     "step_limit",
                     "translation, rotation, or gripper target exceeds configured limit",
                 )
-        # The adapter performs IK validation before it submits any command.
         self.adapter.command_pose(
             target,
             width,
-            max_joint_step=self.limits.joint,
             deadline=request["deadline"],
         )
         self._last_target, self._last_gripper = target.copy(), width
@@ -571,7 +568,7 @@ class Arx5Service:
 
 
 class SdkArx5Adapter:
-    """Use one joint controller and checked IK instead of unchecked Cartesian IK.
+    """Adapt commands and feedback from the SDK Cartesian controller.
 
     ``eef_to_tcp`` right-multiplies the SDK EEF transform. Gripper calibration
     maps model metres to SDK metres as ``sdk = width * scale + offset``.
@@ -685,16 +682,12 @@ class SdkArx5Adapter:
             raise Arx5Error("sdk", "SDK gain change was not acknowledged")
 
     def _replace_target(self, state: Any, gripper: float) -> None:
-        command = self.sdk.JointState(self.dof)
-        command.pos()[:] = state.pos()
-        command.vel()[:] = 0
-        command.torque()[:] = 0
-        command.gripper_pos = gripper
-        command.gripper_vel = command.gripper_torque = 0
-        # SDK initializes a fixed interpolator for a timestamp within 1 ms.
-        # If delayed beyond that window the SDK rejects this past waypoint.
-        command.timestamp = self.controller.get_timestamp()
-        self.controller.set_joint_cmd(command)
+        command = self.sdk.EEFState(
+            self.solver.forward_kinematics(state.pos()), gripper
+        )
+        # The Cartesian controller schedules its preview after solving IK.
+        # Wait for that interpolation before restoring joint stiffness.
+        self.controller.set_eef_cmd(command)
         deadline = time.monotonic() + self.feedback_timeout
         while time.monotonic() < deadline:
             actual = self.controller.get_joint_cmd()
@@ -743,10 +736,9 @@ class SdkArx5Adapter:
         tcp_pose: Any,
         gripper_width: float,
         *,
-        max_joint_step: float,
         deadline: float,
     ) -> None:
-        """Reject IK failures, stale requests, and joint-limit violations."""
+        """Submit a converted EEF target through the SDK Cartesian controller."""
         preview = float(self.controller_config.default_preview_time)
         if (
             not math.isfinite(preview)
@@ -756,29 +748,14 @@ class SdkArx5Adapter:
                 "configuration",
                 "set SDK default_preview_time above controller_dt for interpolated motion",
             )
-        measured = self._joint_state()
+        self._joint_state()
         sdk_pose = matrix_rpy(pose_matrix(tcp_pose) @ np.linalg.inv(self.transform))
-        status, target = self.solver.inverse_kinematics(sdk_pose, measured.pos())
-        if status != 0:
-            raise Arx5Error("ik", f"inverse kinematics failed with status {status}")
-        target = vector(target, self.dof, "ik_target")
-        if (
-            np.any(target < self.robot_config.joint_pos_min)
-            or np.any(target > self.robot_config.joint_pos_max)
-            or np.max(np.abs(target - measured.pos())) > max_joint_step
-        ):
-            raise Arx5Error(
-                "joint_limit", "IK target exceeds joint limits or step limit"
-            )
         sdk_width = gripper_width * self.gripper_scale + self.gripper_offset
         if not 0 <= sdk_width <= self.robot_config.gripper_width:
             raise Arx5Error(
                 "gripper_limit", "gripper target is outside calibrated stroke"
             )
         if time.monotonic() > deadline:
-            raise Arx5Error("expired", "request expired during IK; no target submitted")
-        command = self.sdk.JointState(self.dof)
-        command.pos()[:] = target
-        command.gripper_pos = sdk_width
-        command.timestamp = self.controller.get_timestamp() + preview
-        self.controller.set_joint_cmd(command)
+            raise Arx5Error("expired", "request expired before SDK submission")
+        command = self.sdk.EEFState(sdk_pose, sdk_width)
+        self.controller.set_eef_cmd(command)

@@ -596,21 +596,42 @@ In ``single_stage`` mode, ``a``, ``b``, and ``c`` emit failure, neutral, and
 success rewards. In ``multi_stage`` mode, ``a``, ``b``, and ``c`` switch among
 reward stages, and ``q`` emits a negative reward.
 
-The listener reads a Linux input device directly, so the robot host needs the
-device path before Ray starts. Find the keyboard's event device:
+The listener reads all accessible Linux keyboard event devices on the robot
+host. Any connected keyboard can provide labels; typing into an SSH terminal
+does not generate these events. Before starting Ray, clear any previous
+single-device selection and grant the runtime user read access to the connected
+keyboards. Run this in Bash on the robot host:
 
 .. code:: bash
 
-   ls -l /dev/input/by-id/*-event-kbd
+   unset RLINF_KEYBOARD_DEVICE
+   (
+   set -e
+   mapfile -t rlinf_keyboard_devices < <(
+     for rlinf_keyboard_link in \
+       /dev/input/by-id/*-event-kbd /dev/input/by-path/*-event-kbd; do
+       if [[ -e "$rlinf_keyboard_link" ]]; then
+         readlink -f "$rlinf_keyboard_link"
+       fi
+     done | sort -u
+   )
+   if (( ${#rlinf_keyboard_devices[@]} == 0 )); then
+     printf 'No keyboard event devices found. Check the physical connection.\n' >&2
+     exit 1
+   fi
+   sudo setfacl -m "u:$(id -un):r" "${rlinf_keyboard_devices[@]}"
+   )
 
-An entry such as ``usb-Logitech_USB_Keyboard-event-kbd -> ../event20`` means
-the device is ``/dev/input/event20``. Grant access to it and export the path in
-the shell that runs ``ray start``:
+The command resolves the keyboard links under ``by-id`` and ``by-path``, removes
+duplicates, and grants read access to each event device. At least one readable
+keyboard must be present when the listener starts. It periodically rescans for
+new readable keyboards; unplugging one leaves the others available. Repeat the
+permission step when a reconnected or newly attached keyboard is unreadable.
 
-.. code:: bash
-
-   sudo chmod 666 /dev/input/event20
-   export RLINF_KEYBOARD_DEVICE=/dev/input/event20
+To listen to just one keyboard or foot pedal, optionally export
+``RLINF_KEYBOARD_DEVICE=/dev/input/by-id/<device>-event-kbd`` before
+``ray start``. Ray captures environment variables at startup, so changes to this
+selection require restarting Ray.
 
 Visualization and Results
 -----------------------------

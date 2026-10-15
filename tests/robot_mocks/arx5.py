@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Small ARX SDK simulation at the joint-controller and solver boundary."""
+"""Small ARX SDK simulation at the Cartesian controller boundary."""
 
 import copy
 import time
@@ -53,8 +53,20 @@ class Gain:
         return self._kd
 
 
+class EEFState:
+    def __init__(self, pose, gripper_pos):
+        self._pose = np.asarray(pose).copy()
+        self.timestamp = 0.0
+        self.gripper_pos = gripper_pos
+        self.gripper_vel = self.gripper_torque = 0.0
+
+    def pose_6d(self):
+        return self._pose
+
+
 class FakeArxSDK:
     JointState = JointState
+    EEFState = EEFState
     Gain = Gain
 
 
@@ -120,30 +132,29 @@ class FakeArxController:
             self.gain = copy.deepcopy(gain)
         self.gain_history.append(copy.deepcopy(self.gain))
 
-    def set_joint_cmd(self, command):
+    def set_eef_cmd(self, command):
         if self.fail_command:
             raise RuntimeError("CAN command failed")
         self.command_count += 1
-        self.command = copy.deepcopy(command)
+        # Synthetic kinematics map each pose component to one joint directly.
+        target = JointState(self.robot.joint_dof)
+        target.pos()[:] = command.pose_6d()
+        target.timestamp = command.timestamp or (
+            self.get_timestamp() + self.config.default_preview_time
+        )
+        target.gripper_pos = command.gripper_pos
+        target.gripper_vel = command.gripper_vel
+        target.gripper_torque = command.gripper_torque
+        self.command = target
         if np.any(self.gain.kp() > 0):
-            self.state = copy.deepcopy(command)
+            self.state = copy.deepcopy(target)
 
 
 class FakeArxSolver:
-    """Invertible synthetic kinematics plus independent IK failure injection."""
-
-    def __init__(self):
-        self.status = 0
-        self.delay = 0.0
-        self.target_offset = np.zeros(6)
+    """Forward kinematics matching the synthetic Cartesian controller."""
 
     def forward_kinematics(self, joints):
         return np.asarray(joints).copy()
-
-    def inverse_kinematics(self, pose, seed):
-        if self.delay:
-            time.sleep(self.delay)
-        return self.status, np.asarray(pose).copy() + self.target_offset
 
 
 class InProcessArxClient:

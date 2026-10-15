@@ -47,7 +47,7 @@ Choose a task matching the Stage 1 checkpoint and configure its instruction.
      - Task
      - Configuration
    * - ``Arx5RLTEnv-v1``
-     - Manual reset; operator success/failure labels
+     - Operator success/failure labels; smooth return to a configured start pose
      - ``realworld_arx5_rlt_stage2_ac_mlp``
    * - ``Arx5RLTEnv-v1``
      - Same task and controls with the TD3 Stage 2 head
@@ -111,8 +111,8 @@ Evaluation disables this sampling noise. AC keeps its existing
 Installation
 ------------
 
-Use Python 3.11 for RLinf and the existing Python 3.10 environment for the
-CPython 3.10 ARX SDK binary. From this branch's repository root, install the
+Use Python 3.11 for RLinf and a separate Python 3.10 environment for the
+ARX SDK service. From this branch's repository root, install the
 model and client dependencies:
 
 .. code-block:: bash
@@ -126,6 +126,34 @@ The installer adds OpenPI, UVC capture, and the ZMQ client to the RLinf
 interpreter. The SDK-owning service below runs separately. If you already have
 the model environment, install only the additional client requirements with
 ``python -m pip install -r requirements/embodied/envs/arx5.txt``.
+
+The repository includes the ARX SDK under ``third_party/arx5-sdk``, based on
+upstream commit ``c160db7`` with local emergency-handling fixes. Its source,
+license, and base revision are recorded in
+:download:`third_party/README.md <../../../../../third_party/README.md>`.
+Build the Python extension with the SDK's Python 3.10 environment. In a separate
+terminal, run these commands from the repository root:
+
+.. code-block:: bash
+
+   conda activate arx-py310
+   (
+   set -e
+   cd third_party/arx5-sdk
+   mkdir build && cd build
+   cmake ..
+   make -j
+   )
+
+These are the upstream README's build commands for a fresh build directory.
+For an existing build, enter ``third_party/arx5-sdk/build`` and run
+``cmake ..`` followed by ``make -j``. This builds all default targets, including
+the extension under ``third_party/arx5-sdk/python``, using the C++ dependencies
+in ``arx-py310``. Keep that directory together with the SDK's
+``models`` and ``lib`` directories. For a new SDK environment, follow
+``third_party/arx5-sdk/README.md`` and its
+``conda_environments/py310_environment.yaml``. Use the SDK terminal for the
+service commands below and the RLinf terminal for training.
 
 Configure the Model and Timing
 ------------------------------
@@ -158,6 +186,10 @@ Set the following environment variables before composing the configuration:
      - Calibrated gripper-width bounds in metres, matching the service's conversion.
    * - ``ARX_TASK_DESCRIPTION``
      - Task instruction used by the model.
+   * - ``ARX_RESET_POSE``
+     - Fixed return target as ``[x,y,z,rx,ry,rz]`` in the service TCP frame: XYZ in metres and a rotation vector in radians.
+   * - ``ARX_RESET_GRIPPER``
+     - Gripper width on return, in metres; defaults to 0.085 and must lie within the configured gripper bounds.
 
 The timing variables have no defaults. Dataset output FPS alone does not prove
 the physical action or history interval. Measure image delay with
@@ -174,13 +206,83 @@ that instant. Excessive frame age or feedback gaps stop the episode. The UVC
 capture subprocess isolates native driver hangs; it does not perform model
 inference or enable RTC.
 
+Choose where the arm should return after each completed episode. Replace the
+placeholders below with a target verified for your setup before launching:
+
+.. code-block:: bash
+
+   export ARX_RESET_POSE='[<x>,<y>,<z>,<rx>,<ry>,<rz>]'
+   export ARX_RESET_GRIPPER='<initial gripper width in metres>'
+
+The target uses the same TCP frame as the service's measured feedback and
+absolute commands. With the default identity ``adapter.eef_to_tcp``, this is
+the SDK EEF frame. Convert poses from a previous deployment through its origin,
+tool offset, and orientation transforms first; a UMI TCP rotation vector cannot
+be copied directly into the SDK EEF frame. The target is independent of the
+per-episode observation anchor.
+
+The environment options below apply under both ``env.train.override_cfg`` and
+``env.eval.override_cfg``. The default enables automatic return and requires a
+configured target:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 35 65
+
+   * - Option
+     - Default and behavior
+   * - ``return_on_episode_end``
+     - ``true``: return after success, failure, or the episode step limit. Set ``false`` for manual repositioning.
+   * - ``reset_pose``
+     - Read from ``ARX_RESET_POSE``; six finite values, with no assumed hardware target.
+   * - ``reset_gripper_width``
+     - Read from ``ARX_RESET_GRIPPER``; defaults to 0.085 m.
+   * - ``reset_duration`` / ``reset_frequency``
+     - Generate waypoints for 4.0 seconds at 20.0 Hz, using eased translation and shortest-path rotation interpolation. Sequential communication waits extend the movement beyond this minimum duration.
+   * - ``reset_settle_timeout``
+     - Up to 2.0 additional seconds to reach the final target before holding.
+
+The return finishes when measured position error is at most 5 mm, orientation
+error at most 0.05 rad, and gripper-width error at most 5 mm. Failure to reach
+these tolerances before the settling timeout stops execution with an error.
+The same service command limits and feedback checks apply throughout the return.
+
 Start the Robot Service
 -----------------------
 
 Prepare the arm, load, CAN interface, and calibrated tool frame before starting
 the SDK-owning process. Only one process may control that CAN interface; stop
-any earlier SDK server first. Save your verified service settings as a JSON
-file with the following fields:
+any earlier SDK server first. RLinf uses a JSON service protocol on
+``tcp://127.0.0.1:5557``. The SDK's original ``python/communication/zmq_server.py``
+uses a different protocol on port ``8765`` and cannot serve RLinf clients.
+
+The service loads the patched ``third_party/arx5-sdk`` by default;
+``--sdk-path`` selects another SDK checkout, which does not receive these
+local fixes. Supply the robot model and CAN interface as ``X5 can0``
+or as ``--model X5 --interface can0``. Inspect the effective service settings
+before connecting:
+
+.. code-block:: bash
+
+   "$CONDA_PREFIX/bin/python" toolkits/realworld_check/arx5_server.py \
+     X5 can0 --print-config
+
+``--print-config`` prints the merged software defaults and JSON overrides, then
+exits without importing the SDK or opening hardware. The service uses SDK
+robot/controller defaults with the settings in
+``toolkits/realworld_check/arx5_server_defaults.json``, summarized below.
+To carry over settings from an existing
+deployment, copy its explicit Python configuration overrides into a JSON file
+and pass ``--config /path/to/arx5.json``. Each supplied field overrides the
+matching default within its section; other fields keep their defaults.
+
+The service loads ``cartesian_controller`` from the SDK configuration factory
+and constructs ``Arx5CartesianController``. It passes end-effector
+targets to ``set_eef_cmd``; the SDK handles IK retries, joint targets, and
+interpolation. The local emergency fixes preserve normal Cartesian IK behavior
+and SDK defaults. The empty ``controller``
+section in the service defaults preserves the SDK's Cartesian controller gains
+and 0.1-second interpolation preview.
 
 .. list-table::
    :header-rows: 1
@@ -189,30 +291,33 @@ file with the following fields:
    * - Setting
      - Meaning
    * - ``robot`` / ``controller``
-     - Explicit overrides of SDK configuration fields, including validated gravity settings.
+     - Overrides of SDK configuration fields, including gripper calibration, gains, and gravity settings from your deployment.
    * - ``controller.default_preview_time``
-     - Validated SDK target-transition duration in seconds, greater than ``controller_dt``; distinct from the model action interval.
+     - SDK target-transition duration; uses the ``cartesian_controller`` default of 0.1 s and must exceed ``controller_dt``. This is separate from the model action interval.
    * - ``adapter.eef_to_tcp``
-     - Calibrated 4 × 4 transform from SDK EEF to the model tool frame.
+     - 4 × 4 transform from SDK EEF to the model tool frame; defaults to the identity transform.
    * - ``adapter.gripper_scale`` / ``gripper_offset``
-     - Conversion into the gripper metres used by the checkpoint.
+     - Conversion into the checkpoint's gripper metres; defaults to 1.0 and 0.0, preserving the SDK's metre values.
    * - ``adapter.drag_kd`` / ``drag_gripper``
-     - Six validated drag damping values; ``hold`` or ``manual`` gripper behavior.
+     - Six drag damping values, defaulting to the controller's ``default_kd``; ``hold`` (default) or ``manual`` gripper behavior.
    * - ``limits``
-     - Positive per-command ``translation`` (m), ``rotation`` (rad), ``gripper`` (m), and ``joint`` (rad) limits.
+     - Positive per-command limits: ``translation`` 0.05 m, ``rotation`` 0.2 rad, and ``gripper`` 0.02 m by default.
    * - ``service``
-     - Feedback rate/history and state/command timeout settings.
+     - Feedback rate/history and state/command timeout settings; ``command_timeout`` defaults to 10 s in this entrypoint.
    * - ``calibration_confirmed``
-     - Set to ``true`` only after validating these settings on the actual rig.
+     - Optional deployment status. An explicit ``false`` blocks ``--allow-motion``; omitting the field permits startup with the motion flag.
+
+The identity transform uses the SDK EEF frame directly. Check that this frame
+and the SDK gripper widths match the training data; these defaults do not
+establish compatibility with a UMI checkpoint. Review the motion limits for
+your rig and task. If the old deployment changes gripper readout, width, or
+gains in its Python script, carry those overrides into the JSON as well.
 
 Use the SDK interpreter to start the service initially with motion disabled:
 
 .. code-block:: bash
 
-   /media/lenovo/data/miniconda3/envs/arx-py310/bin/python \
-     toolkits/realworld_check/arx5_server.py \
-     --sdk-path /home/lenovo/kian/arx5-sdk --model X5 --interface can0 \
-     --config /path/to/verified-arx5.json
+   "$CONDA_PREFIX/bin/python" toolkits/realworld_check/arx5_server.py X5 can0
 
 The service binds to ``tcp://127.0.0.1:5557`` by default. SDK construction starts
 its CAN/control loop and may apply gravity or damping; this is an active
@@ -220,14 +325,29 @@ controller connection, even with policy motion disabled. Check feedback from a
 second terminal using ``python toolkits/realworld_check/arx5_server.py --operation state``.
 Support the arm and payload before stopping the owning SDK process, because
 SDK shutdown can change damping. Restart the service with ``--allow-motion``
-only for supervised hardware validation and operation; that option requires
-explicit limits, confirmed calibration and a valid SDK preview time.
+for supervised hardware validation and operation, adding ``--config`` when you
+have deployment overrides. RLinf checks end-effector step limits, gripper
+travel, command deadlines, the control epoch, and live feedback before calling
+the SDK. The motion flag does not bypass those checks or the command watchdog.
+Normal IK and joint handling follow the upstream Cartesian controller implementation.
 
 Measure the largest normal gap between model commands, including synchronous
 inference and learner updates, before choosing ``service.command_timeout``.
-The default is two seconds; expiry holds the measured pose and changes the
-control epoch. State reads do not renew this timer. Explicitly resume control
+The entrypoint default is ten seconds; expiry holds the measured pose and
+changes the control epoch. State reads do not renew this timer. Explicitly resume control
 after diagnosing a timeout; an old action chunk cannot silently restart it.
+
+The local SDK fixes release state and command locks before emergency handling,
+raise ``RuntimeError`` on startup validation failures, and let background
+emergency damping stop during destruction. After a fault, both Joint and
+Cartesian controllers reject further motion commands. Resolve the underlying fault
+and recreate the controller or restart the service.
+
+The SDK runs directly in the service process. During service operation,
+``Ctrl+C`` or ``SIGTERM`` requests ``service.stop()``; the SDK handles normal
+cleanup. Support the arm and payload before stopping. Use the SDK built under
+``third_party/arx5-sdk`` to receive the emergency-handling fixes, and resolve
+gripper calibration errors that caused an emergency before restarting.
 
 Run It
 ------
@@ -260,7 +380,69 @@ to the measured pose, start synchronous training:
 
    bash examples/embodiment/run_embodiment.sh "$TRAIN_CONFIG"
 
-The episode waits for the operator to establish the starting pose and press
+After the environment starts, open the
+`local camera preview <http://127.0.0.1:8765/>`_ in a browser on the robot host.
+The log prints the URL; no window opens automatically. AC and TD3 training
+enable the preview by default, while evaluation leaves it disabled. The page
+shows the camera image scaled with its aspect ratio preserved, the EP number,
+and the current state. It keeps updating while waiting for ``s``, during
+inference, and during return movements, and indicates stale frames or a lost
+connection.
+
+EP numbering starts at 1 and advances only when a new episode successfully
+starts; while waiting, it shows the next episode number. Repeated ``s`` presses,
+``g``, ``r``, ``b``, ``v``, and a completed 64-step rollout do not increment it.
+Restarting the process or resuming a checkpoint resets this display to 1. It
+does not track the runner's ``global_step`` or the replay trajectory count.
+
+Closing the page leaves collection running. To disable the preview, set
+``env.train.override_cfg.enable_camera_preview=false``; configure the port with
+``env.train.override_cfg.camera_preview_port``, which defaults to ``8765``.
+Evaluation uses the corresponding ``env.eval.override_cfg`` settings; keep it
+disabled when training uses the same port. A port conflict produces a warning and collection continues
+without the preview. Display resizing and EP labels leave model and replay
+images unchanged. Video recording is controlled independently by
+``video_cfg.save_video``, which remains ``false`` in these configurations.
+
+Choose which networks to update with ``algorithm.update_epoch`` and
+``algorithm.train_actor``. The latter defaults to ``true`` in both ARX
+configurations. Set these explicitly when moving between stages:
+
+.. list-table::
+   :header-rows: 1
+
+   * - ``algorithm.update_epoch``
+     - ``algorithm.train_actor``
+     - Behavior
+   * - ``0``
+     - ``false``
+     - Collect and save data without updating actor or Q.
+   * - Positive
+     - ``false``
+     - Update Q once replay meets the training threshold.
+   * - Positive
+     - ``true``
+     - Update Q and actor at the configured ratio once replay meets the training thresholds.
+
+With ``algorithm.train_actor=false``, the actor and entropy temperature alpha
+optimizers and their learning rate schedulers are skipped. The Q optimizer,
+Q learning rate scheduler and target model EMA continue at their configured
+rates. The current RLT MLP policies have separate actor and ``q_head`` parameters,
+so the online actor keeps its initialized or resumed weights, while Stage 1
+remains frozen. AC continues to generate TD target actions with the online actor
+and its ``fixed_std: 0.002`` sampling noise. TD3 continues to use its target
+actor, following the configured target model updates. Selecting the reference
+branch with ``start_with_actor=false`` controls arm execution and does not
+replace those TD target actions with exact reference actions.
+
+When learner updates run, ``train/actor/updated`` reports the mean of the 0/1
+indicators for actual actor optimization at each update; it stays at 0 when
+only Q is trained. With RLT scheduling enabled,
+``train/rlt/actor_updates_run`` reports the actual actor update count for the
+iteration. The runner's ``global_step`` counts collection and training
+iterations, not optimizer updates.
+
+For the first episode, establish the starting arm and object poses and press
 ``s``. Training starts with the Stage 1 reference policy; press ``b`` when the
 Stage 2 actor should take over. These keys are handled independently of model
 inference, through the environment's keyboard listener:
@@ -280,24 +462,46 @@ inference, through the environment's keyboard listener:
      - Enter gravity-compensated drag; invalidate queued model commands.
    * - ``r``
      - Hold the current measured pose and resume policy control with new observations.
-   * - ``c`` / ``a`` / ``q``
-     - Mark success / failure / abort and hold position. While waiting to start,
-       ``q`` cancels the wait; ``c`` and ``a`` are ignored.
+   * - ``c`` / ``a``
+     - Mark success / failure, hold until the chunk ends, then return to the configured start pose. Ignored while waiting to start.
+   * - ``q``
+     - Abort and hold without returning. While waiting to start, cancel the wait.
 
-Reset is manual: establish the next starting pose, then press ``s`` again.
-While waiting to start, ``r`` holds the measured pose without enabling policy
-motion. The environment does not call a joint-home routine. Keyboard control
-reads the local Linux keyboard through evdev. Grant the runtime user read
-access to the intended device under ``/dev/input`` and select its stable path
-before launching RLinf:
+After success or failure, the environment records the terminal transition,
+returns smoothly, and holds the reached pose. Reaching the episode step limit
+also triggers this return. Prepare the objects for the next episode, then press
+``s`` again. While waiting to start, ``r`` only holds the measured pose.
+
+During return, ``g`` cancels the movement and enters drag; ``q`` or ``r`` cancels
+it and holds the current measured pose. The keys ``s``, ``b``, ``v``, ``c`` and
+``a`` are ignored until return ends. A cancelled return is not retried
+automatically. Drag takeover remains active through automatic reset until
+``s`` or ``r`` restores hold. Aborting an episode, a fault, or closing the
+environment does not initiate a return.
+
+Return completes before the terminating step returns, including when
+``auto_reset=false``. With the default ``auto_reset=true``, the next reset waits
+for ``s`` even if the completed episode was in the last rollout chunk; that
+wait can delay saving the current iteration. A 64-step training rollout is
+shorter than the configured 320-step episode limit: ending a rollout alone
+does not trigger return.
+
+Keyboard control uses evdev to listen to every readable keyboard on the robot
+host. Grant the runtime user read access to the keyboard event devices as described in
+:doc:`franka`, then clear any previous single-device selection before launching
+RLinf or starting Ray:
 
 .. code-block:: bash
 
-   export RLINF_KEYBOARD_DEVICE='/dev/input/by-id/<keyboard>-event-kbd'
+   unset RLINF_KEYBOARD_DEVICE
 
-Choose the keyboard attached to the robot host; the listener uses its device
-events, so typing into an SSH terminal does not send these controls. From a
-separate terminal, ``--operation
+Press the controls on any keyboard attached to the robot host; typing into an
+SSH terminal does not send these device events. The listener periodically
+rescans for new readable keyboards, and other keyboards remain usable when one
+is unplugged. At least one readable keyboard must be present at startup.
+Reconnected or newly attached devices may need read permission granted again.
+To restrict input to one device, optionally set ``RLINF_KEYBOARD_DEVICE`` to its
+event device path. From a separate terminal, ``--operation
 enter_drag`` and ``--operation hold`` reach the service even while inference is
 waiting; those service operations do not provide episode labels.
 
@@ -308,24 +512,59 @@ path. Interrupted or stale transitions are excluded by
 label holds the arm immediately; the environment then samples the remaining
 chunk intervals at that held pose and records the terminal reward once at the
 chunk boundary. These measured hold samples preserve the outcome in replay;
-abort, fault and stale-control samples remain invalid. Operator events and measured
-step records are saved under ``runner.logger.log_path/arx5_raw`` as JSONL;
-these records are not a complete image dataset.
+abort, fault and stale-control samples remain invalid. The terminal observation
+is captured before return, and return movements do not enter replay. Operator
+events, measured steps, and separate return events are saved under
+``runner.logger.log_path/arx5_raw`` as JSONL; these records are not a complete
+image dataset.
 
 Save, Resume, and Evaluate
 --------------------------
 
-Keep a complete RLinf checkpoint to resume optimizer, target-network and the
-retained replay window. ``auto_save: false`` disables per-trajectory automatic
-saving; the actor checkpoint still writes the cached replay trajectories under
-``actor/sac_components/replay_buffer``. The default saves every ten training
-epochs. Resume by supplying the
-``global_step_<N>`` directory:
+Keep a complete RLinf checkpoint to resume the optimizers, target network and
+replay data. Replay checkpoint saving waits for pending trajectory writes, then
+saves matching metadata, an index and trajectory files under
+``actor/sac_components/replay_buffer``. With ``auto_save: true``, this includes
+all indexed trajectories persisted to disk, including those that have never
+been sampled when collecting with ``algorithm.update_epoch=0``. With
+``auto_save: false``, individual trajectories are not automatically written to
+disk; checkpoint saving includes the data still available in the retained cache
+or on disk. Trajectories evicted from memory before being written to disk are
+omitted; restored trajectory and sample counts reflect the saved data. Saving
+again after a resume includes both trajectories loaded from the earlier
+checkpoint and new trajectories that are still available, using each
+trajectory's source.
+
+A failed background write or a missing required trajectory file raises an error
+during checkpoint saving. Wait for saving to complete successfully before
+archiving the checkpoint; the presence of its directory alone does not establish
+completion. This does not restore files missing from older checkpoints or
+guarantee pending writes after a forced exit. Transitions still held by the
+environment and not yet sent to replay are outside the saved snapshot.
+
+The default saves every ten training epochs. To train Q from a collection
+checkpoint, replace the path below with your actual ``global_step_1`` directory.
+This example runs one more iteration and saves its result. Q updates still
+require ``algorithm.replay_buffer.min_buffer_size: 64``, which counts trajectory
+entries. After collecting only the first iteration, the next iteration may
+perform no Q updates. This command demonstrates the resume settings; set an
+appropriate cumulative iteration limit for the actual Q training run. Run it
+from the repository root:
 
 .. code-block:: bash
 
-   bash examples/embodiment/run_embodiment.sh "$TRAIN_CONFIG" \
-     runner.resume_dir=/path/to/checkpoints/global_step_10
+   python examples/embodiment/train_embodied_agent.py --config-name "$TRAIN_CONFIG" \
+     algorithm.update_epoch=8 \
+     algorithm.train_actor=false \
+     runner.resume_dir=/path/to/checkpoints/global_step_1 \
+     runner.max_epochs=2 \
+     runner.save_interval=1
+
+``runner.max_epochs`` is a cumulative iteration limit and must exceed the loaded
+``global_step``. Increase it accordingly when resuming a later checkpoint. This
+entry point still initializes the real environment and collects rollouts each
+iteration before learning from replay. Set ``algorithm.train_actor=true``
+explicitly when you are ready to train the actor as well.
 
 Keep the algorithm and model dimensions from that checkpoint when resuming.
 AC and TD3 checkpoints use different heads and are not interchangeable; both

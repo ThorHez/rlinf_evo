@@ -134,10 +134,15 @@ exclude = ["tests*", "docs*", "examples*", "docker*", "toolkits*"]
 [tool.setuptools.package-data]
 rlinf = ["**/*.yaml", "**/*.yml"]
 
+[tool.pytest.ini_options]
+# Upstream SDK test_*.py files are standalone hardware examples.
+addopts = ["--ignore=third_party"]
+
 [tool.ruff]
 line-length = 88
 indent-width = 4
 target-version = "py311"
+extend-exclude = ["third_party"]
 
 [tool.ruff.lint]
 isort = {known-first-party = ["rlinf"]}
@@ -175,4 +180,3 @@ skip-magic-trailing-comma = false
 line-ending = "auto"
 docstring-code-format = true
 docstring-code-line-length = "dynamic"
-

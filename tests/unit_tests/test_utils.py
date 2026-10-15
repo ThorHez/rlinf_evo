@@ -830,6 +830,7 @@ _ARX_REQUIRED_ENV = {
     "ARX_GRIPPER_MAX": "0.085",
     "ARX_CAMERA_DEVICE": "/dev/v4l/by-id/fake-arx-camera",
     "ARX_TASK_DESCRIPTION": "pick the test object",
+    "ARX_RESET_POSE": "[0.25,0,0.35,0,0,0]",
     "RLT_STAGE2_WEIGHTS": "/tmp/arx-stage2-test-weights.pt",
 }
 
@@ -870,6 +871,7 @@ def test_arx_stage2_configs_share_model_contract_and_resolve_without_hardware(
     assert cfg.algorithm.loss_type == f"rlt_{algorithm}"
     assert cfg.algorithm.replay_buffer.filter_invalid_transitions is True
     assert cfg.algorithm.reference_dropout_prob == 0.0
+    assert cfg.algorithm.train_actor is True
     actor = cfg.actor.model
     assert actor.model_type == (
         "rlt_mlp_policy" if algorithm == "ac" else "rlt_td3_mlp_policy"
@@ -925,6 +927,10 @@ def test_arx_stage2_configs_share_model_contract_and_resolve_without_hardware(
         assert parsed.gripper_width_min == actor.gripper_width_min
         assert parsed.gripper_width_max == actor.gripper_width_max
         assert parsed.start_with_actor is (evaluation and mode == "eval")
+        assert parsed.return_on_episode_end is True
+        assert parsed.reset_pose == [0.25, 0, 0.35, 0, 0, 0]
+        assert parsed.reset_gripper_width == 0.085
+        assert parsed.enable_camera_preview is (mode == "train")
     if evaluation:
         assert cfg.runner.ckpt_path == _ARX_REQUIRED_ENV["RLT_STAGE2_WEIGHTS"]
         assert cfg.rollout.collect_transitions is False
@@ -947,11 +953,31 @@ def test_arx_stage2_configs_refuse_missing_model_and_calibration_inputs(
         monkeypatch.setenv(name, value)
     monkeypatch.delenv(missing, raising=False)
     cfg = _compose_arx_config(monkeypatch, algorithm=algorithm, evaluation=evaluation)
+    if missing == "ARX_RESET_POSE":
+        from rlinf.envs.real.arx5.rlt import Arx5RLTEnvConfig
+
+        OmegaConf.resolve(cfg)
+        with pytest.raises(ValueError, match="ARX_RESET_POSE"):
+            Arx5RLTEnvConfig(**OmegaConf.to_container(cfg.env.train.override_cfg))
+        return
     if missing == "RLT_STAGE2_WEIGHTS" and not evaluation:
         OmegaConf.resolve(cfg)
         return
     with pytest.raises(InterpolationResolutionError, match=missing):
         OmegaConf.resolve(cfg)
+
+
+@pytest.mark.parametrize("pose", ["not-json", "[0,0]", "[0,0,0,NaN,0,0]"])
+def test_arx_stage2_configs_reject_invalid_reset_pose(monkeypatch, pose):
+    from rlinf.envs.real.arx5.rlt import Arx5RLTEnvConfig
+
+    for name, value in _ARX_REQUIRED_ENV.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("ARX_RESET_POSE", pose)
+    cfg = _compose_arx_config(monkeypatch)
+    OmegaConf.resolve(cfg)
+    with pytest.raises(ValueError, match="reset_pose"):
+        Arx5RLTEnvConfig(**OmegaConf.to_container(cfg.env.train.override_cfg))
 
 
 class _ActionProbeResult:

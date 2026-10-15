@@ -558,6 +558,12 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
 
     @Worker.timer("update_one_epoch")
     def update_one_epoch(self, train_actor: bool = True):
+        """Update Q and, when both config and caller allow it, actor and alpha."""
+        update_actor = (
+            self.cfg.algorithm.get("train_actor", True)
+            and train_actor
+            and self.update_step % self.critic_actor_ratio == 0
+        )
         global_batch_size_per_rank = (
             self.cfg.actor.global_batch_size // self._world_size
         )
@@ -601,10 +607,11 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             "sac/critic_loss": np.mean(gbs_critic_loss),
             "critic/lr": self.qf_optimizer.param_groups[0]["lr"],
             "critic/grad_norm": qf_grad_norm,
+            "actor/updated": float(update_actor),
             **all_critic_metrics,
         }
 
-        if self.update_step % self.critic_actor_ratio == 0 and train_actor:
+        if update_actor:
             self.optimizer.zero_grad()
             gbs_actor_loss = []
             gbs_entropy = []

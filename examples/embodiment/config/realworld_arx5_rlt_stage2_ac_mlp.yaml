@@ -61,6 +61,8 @@ runner:
     enabled: false
 algorithm:
   update_epoch: 8
+  # Set false to update only Q; actor and entropy-temperature updates are skipped.
+  train_actor: true
   group_size: 1
   agg_q: min
   actor_agg_q: q1
@@ -100,6 +102,8 @@ env:
   train:
     rollout_epoch: 1
     max_steps_per_rollout_epoch: 64
+    override_cfg:
+      enable_camera_preview: true
   eval:
     rollout_epoch: 1
     max_steps_per_rollout_epoch: 320

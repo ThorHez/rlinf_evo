@@ -15,6 +15,7 @@
 import errno
 import os
 import threading
+import time
 from collections import deque
 from typing import Any
 
@@ -24,7 +25,11 @@ _logger = get_logger()
 
 
 class KeyboardListener:
-    """Headless keyboard listener backed by Linux evdev input devices."""
+    """Read all accessible evdev keyboards, including newly connected devices.
+
+    Set ``RLINF_KEYBOARD_DEVICE`` to restrict input to one device. Otherwise,
+    key presses from all keyboards share one queue.
+    """
 
     REQUIRED_KEY_NAMES = ("KEY_A", "KEY_B", "KEY_C", "KEY_Q")
 
@@ -45,104 +50,87 @@ class KeyboardListener:
         self.latest_data = {"key": None}
         # Queue press edges so short taps are not lost between polls.
         self._press_events: deque[str] = deque()
+        self._held_keys: dict[tuple[str, str], None] = {}
         self._stop = threading.Event()
-        self._device_lock = threading.Lock()
-        self._closed = False
+        self._ready = threading.Event()
         self._error: Exception | None = None
-        self.device = self._open_keyboard_device()
+        self._override_path = os.environ.get("RLINF_KEYBOARD_DEVICE")
+        self._devices: dict[str, Any] = {}
 
         self.listener = threading.Thread(
             target=self._listen_loop,
-            name=f"KeyboardListener:{self.device.path}",
+            name="KeyboardListener",
             daemon=True,
         )
-        self.listener.start()
+        try:
+            self._refresh_devices(required=True)
+            self.listener.start()
+        except BaseException:
+            self._stop.set()
+            self._close_devices()
+            raise
+        finally:
+            self._ready.set()
         self.last_intervene = 0
 
-    def _open_keyboard_device(self) -> Any:
-        override_path = os.environ.get("RLINF_KEYBOARD_DEVICE")
-        if override_path:
-            device = self._open_device(override_path, is_override=True)
-            if not self._is_keyboard_device(device):
-                device.close()
-                raise RuntimeError(
-                    "KeyboardListener device set by "
-                    f"RLINF_KEYBOARD_DEVICE='{override_path}' does not look like a "
-                    "keyboard device. Point it to the correct /dev/input/eventX path."
-                )
-            return device
-
+    def _refresh_devices(self, *, required: bool = False) -> None:
+        paths = (
+            [self._override_path]
+            if self._override_path
+            else sorted(self._list_devices())
+        )
         permission_denied_paths: list[str] = []
-        keyboards: list = []  # (path, device) for every device that has KEY_A/B/C/Q
-        for device_path in sorted(self._list_devices()):
+        for device_path in paths:
+            if self._stop.is_set():
+                return
+            if device_path in self._devices:
+                continue
             try:
-                device = self._open_device(device_path)
-            except PermissionError:
-                permission_denied_paths.append(device_path)
+                device = self._input_device_cls(device_path)
+            except OSError as exc:
+                if required and self._override_path:
+                    raise RuntimeError(
+                        "KeyboardListener cannot open "
+                        f"RLINF_KEYBOARD_DEVICE='{device_path}': {exc}"
+                    ) from exc
+                if isinstance(exc, PermissionError):
+                    permission_denied_paths.append(device_path)
+                # Devices may disappear while discovery is in progress.
                 continue
 
-            if self._is_keyboard_device(device):
-                keyboards.append((device_path, device))
-            else:
+            try:
+                is_keyboard = self._is_keyboard_device(device)
+            except OSError:
                 device.close()
+                continue
+            except BaseException:
+                device.close()
+                raise
+            if not is_keyboard or self._stop.is_set():
+                device.close()
+                if required and self._override_path and not is_keyboard:
+                    raise RuntimeError(
+                        f"RLINF_KEYBOARD_DEVICE='{device_path}' is not a keyboard."
+                    )
+                continue
+            self._devices[device_path] = device
+            _logger.info("Listening for keyboard input on %s.", device_path)
 
-        if len(keyboards) == 1:
-            return keyboards[0][1]
-        if len(keyboards) > 1:
-            for _, dev in keyboards:
-                dev.close()
-            listing = "\n".join(
-                f"  {path}  name={dev.name!r}" for path, dev in keyboards
-            )
-            raise RuntimeError(
-                "Multiple keyboard-capable devices on /dev/input/event*; "
-                "set RLINF_KEYBOARD_DEVICE to the intended one (prefer a "
-                "/dev/input/by-id/... path so it survives reboots).\n"
-                f"Candidates:\n{listing}"
-            )
-
+        if self._devices or not required:
+            return
         if permission_denied_paths:
             denied = ", ".join(permission_denied_paths)
             raise RuntimeError(
                 "KeyboardListener could not open any readable keyboard device under "
                 f"/dev/input/event*. Permission denied for: {denied}. Grant the runtime "
-                "user read access via the input group or udev rules, or set "
-                "RLINF_KEYBOARD_DEVICE to a readable keyboard event device."
+                "user read access via ACLs, the input group, or udev rules."
             )
 
         raise RuntimeError(
             "KeyboardListener could not find a readable keyboard device under "
-            "/dev/input/event*. Ensure a physical keyboard is connected, the runtime "
-            "user has access to input devices, or set RLINF_KEYBOARD_DEVICE to the "
-            "correct /dev/input/eventX path."
+            "/dev/input/event*. Ensure a physical keyboard is connected and the "
+            "runtime user has read access to its input device."
         )
-
-    def _open_device(self, device_path: str, is_override: bool = False) -> Any:
-        try:
-            return self._input_device_cls(device_path)
-        except FileNotFoundError as exc:
-            if is_override:
-                raise RuntimeError(
-                    f"KeyboardListener override path '{device_path}' does not exist."
-                ) from exc
-            raise
-        except PermissionError as exc:
-            if is_override:
-                raise RuntimeError(
-                    "KeyboardListener cannot read the device set by "
-                    f"RLINF_KEYBOARD_DEVICE='{device_path}'. Grant the runtime user "
-                    "read access via the input group or udev rules."
-                ) from exc
-            raise
-        except OSError as exc:
-            if is_override:
-                raise RuntimeError(
-                    "KeyboardListener failed to open the device set by "
-                    f"RLINF_KEYBOARD_DEVICE='{device_path}': {exc}"
-                ) from exc
-            raise RuntimeError(
-                f"KeyboardListener failed to open input device '{device_path}': {exc}"
-            ) from exc
 
     def _is_keyboard_device(self, device: Any) -> bool:
         required_codes = {
@@ -153,85 +141,88 @@ class KeyboardListener:
         return required_codes.issubset(supported_key_codes)
 
     def _listen_loop(self) -> None:
-        # Retain the path so the listener can recover after USB disconnects.
-        device_path = self.device.path
-        # evdev opens input descriptors O_NONBLOCK. Bounded reads let close()
-        # terminate an idle listener without depending on a new key event.
-        while not self._stop.wait(0.01):
-            try:
-                for event in self.device.read():
-                    if self._stop.is_set():
-                        return
-                    if event.type != self._ecodes.EV_KEY:
-                        continue
-
-                    key = self._event_to_key(event.code)
-                    if key is None:
-                        continue
-
-                    if event.value == 1:
-                        # Enqueue the initial press only, not key-repeat events.
-                        with self.state_lock:
-                            self.latest_data["key"] = key
-                            self._press_events.append(key)
-                    elif event.value == 2:
-                        with self.state_lock:
-                            self.latest_data["key"] = key
-                    elif event.value == 0:
-                        with self.state_lock:
-                            if self.latest_data["key"] == key:
-                                self.latest_data["key"] = None
-            except BlockingIOError:
-                continue
-            except OSError as exc:
-                if self._stop.is_set():
-                    return
-                if exc.errno != errno.ENODEV:
-                    _logger.error(
-                        "Keyboard device %s read failed (errno=%s): %s",
-                        device_path,
-                        exc.errno,
-                        exc,
-                    )
-                    with self.state_lock:
-                        self._error = exc
-                        self.latest_data["key"] = None
-                    return
-                _logger.warning(
-                    "Keyboard device %s disconnected (errno=ENODEV); "
-                    "reopening until it returns.",
-                    device_path,
-                )
-                with self.state_lock:
-                    self.latest_data["key"] = None
-                try:
-                    self.device.close()
-                except Exception:
-                    pass
-                # Keep retrying until the device returns or the process exits.
-                while not self._stop.wait(0.5):
+        # Transfer descriptor ownership after initialization, including cleanup
+        # if Thread.start() is interrupted before returning to the constructor.
+        self._ready.wait()
+        next_scan = time.monotonic() + 0.5
+        try:
+            # evdev reads are non-blocking. One unplugged keyboard must not
+            # prevent polling the others while waiting for reconnection.
+            while not self._stop.wait(0.01):
+                for device_path, device in list(self._devices.items()):
                     try:
-                        with self._device_lock:
+                        for event in device.read():
                             if self._stop.is_set():
                                 return
-                            replacement = self._input_device_cls(device_path)
-                            if self._stop.is_set():
-                                replacement.close()
-                                return
-                            self.device = replacement
-                        break
-                    except (FileNotFoundError, OSError):
+                            self._record_event(device_path, event)
+                    except BlockingIOError:
                         continue
-                else:
-                    return
-                _logger.info("Keyboard device %s reopened.", device_path)
-            except Exception as exc:
-                if not self._stop.is_set():
-                    with self.state_lock:
-                        self._error = exc
-                        self.latest_data["key"] = None
-                    _logger.error("Keyboard device %s failed: %s", device_path, exc)
-                return
+                    except OSError as exc:
+                        if exc.errno != errno.ENODEV:
+                            _logger.error(
+                                "Keyboard device %s read failed: %s", device_path, exc
+                            )
+                            raise
+                        _logger.warning(
+                            "Keyboard device %s disconnected; waiting for keyboards "
+                            "to reconnect.",
+                            device_path,
+                        )
+                        self._drop_device(device_path)
+                if time.monotonic() >= next_scan:
+                    self._refresh_devices()
+                    next_scan = time.monotonic() + 0.5
+        except Exception as exc:
+            if not self._stop.is_set():
+                with self.state_lock:
+                    self._error = exc
+                    self._held_keys.clear()
+                    self.latest_data["key"] = None
+                _logger.error("Keyboard input failed: %s", exc)
+        finally:
+            self._close_devices()
+
+    def _record_event(self, device_path: str, event: Any) -> None:
+        if event.type != self._ecodes.EV_KEY:
+            return
+        key = self._event_to_key(event.code)
+        if key is None:
+            return
+        with self.state_lock:
+            identity = (device_path, key)
+            if event.value in (1, 2):
+                self._held_keys.pop(identity, None)
+                self._held_keys[identity] = None
+                self.latest_data["key"] = key
+                if event.value == 1:
+                    # Enqueue the initial press only, not key-repeat events.
+                    self._press_events.append(key)
+            elif event.value == 0:
+                self._held_keys.pop(identity, None)
+                self._update_held_key()
+
+    def _update_held_key(self) -> None:
+        # Called with state_lock held; releases on one keyboard leave the
+        # keys held on other keyboards available to get_key().
+        self.latest_data["key"] = (
+            next(reversed(self._held_keys))[1] if self._held_keys else None
+        )
+
+    def _drop_device(self, device_path: str) -> None:
+        device = self._devices.pop(device_path)
+        try:
+            device.close()
+        except Exception as exc:
+            _logger.warning("Could not close keyboard %s: %s", device_path, exc)
+        with self.state_lock:
+            for identity in list(self._held_keys):
+                if identity[0] == device_path:
+                    del self._held_keys[identity]
+            self._update_held_key()
+
+    def _close_devices(self) -> None:
+        for device_path in list(self._devices):
+            self._drop_device(device_path)
 
     @property
     def error(self) -> Exception | None:
@@ -240,17 +231,15 @@ class KeyboardListener:
             return self._error
 
     def close(self) -> None:
-        """Stop polling and reconnecting, and release the input descriptor."""
+        """Stop discovery and polling, and release all input descriptors."""
         self._stop.set()
-        with self._device_lock:
-            if not self._closed:
-                self.device.close()
-                self._closed = True
+        # The polling thread owns the descriptors and closes them in finally.
         if self.listener is not threading.current_thread():
             self.listener.join(timeout=1.0)
             if self.listener.is_alive():
                 raise RuntimeError("Keyboard input thread did not stop")
         with self.state_lock:
+            self._held_keys.clear()
             self.latest_data["key"] = None
             self._press_events.clear()
 
@@ -269,7 +258,7 @@ class KeyboardListener:
         return key_name.lower()
 
     def get_key(self) -> str | None:
-        """Return the currently held key, or ``None``.
+        """Return the most recently active key still held, or ``None``.
 
         Only reflects held state; fast taps may be missed between polls.
         Use :meth:`pop_pressed_keys` when you need lossless press detection.

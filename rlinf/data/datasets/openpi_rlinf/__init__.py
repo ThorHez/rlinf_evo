@@ -48,6 +48,7 @@ _SFT_DATALOADER_BUILDERS = {
     "behavior": _load_behavior_sft_dataloader,
     "dualfranka": _load_dual_franka_sft_dataloader,
     "robotwin": _load_official_openpi_sft_dataloader,
+    "umi": _load_official_openpi_sft_dataloader,
 }
 
 

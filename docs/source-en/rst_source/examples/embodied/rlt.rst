@@ -639,6 +639,67 @@ When resuming after unsaved updates, set
 hide stale later TensorBoard events while retaining earlier history. Use a new
 output directory to intentionally roll back checkpoint selection.
 
+Train a from-start UMI checkpoint
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Checkpoints trained with episode-start-relative positions use a different state
+representation. Select ``actor.model.openpi.config_name: pi05_umi_v4_from_start``
+and supply that checkpoint's normalization file. Each observation contains two
+10-dimensional states: episode-relative XYZ, episode-relative rotation in 6D,
+and gripper width. XYZ is normalized before the history is flattened to 20
+scalars and tokenized. Actions remain 16 current-observation-relative targets
+with 10 active dimensions, padded to 32 for the model. The existing
+``pi05_umi_v4`` configuration retains its 32-dimensional state representation.
+
+For multiple recordings, ``data.sources`` selects episodes separately for each
+source and applies its image layout. For example, extend the holdout recipe with:
+
+.. code:: yaml
+
+   actor:
+     model:
+       openpi:
+         config_name: pi05_umi_v4_from_start
+       openpi_data:
+         norm_stats_path: /path/to/from_start/assets/norm_stats.json
+   data:
+     sources:
+       - repo_id: /path/to/historical_dataset
+         image_horizon: 2
+         weight: 1.0
+         train_episode_ids: /path/to/historical_train.json
+         val_episode_ids: /path/to/historical_val.json
+       - repo_id: /path/to/recent_dataset
+         image_horizon: 1
+         weight: 20.0
+         train_episode_ids: /path/to/recent_train.json
+         val_episode_ids: /path/to/recent_val.json
+     val_frames_per_episode: 36
+
+With ``data.sources``, its per-source episode lists determine the selection;
+the single-dataset episode lists do not apply. Weights are per frame: source
+probability is proportional to its selected training-frame count times its
+weight. Training samples with replacement, partitioning one seeded draw across
+ranks. Validation uses fixed frames, interleaves episodes across all sources,
+and does not apply training weights. Source paths, episode selections, weights,
+image layouts and normalization are included in the resume-order signature.
+
+If the base model used separate normalization for each recording, set
+``norm_stats_path`` on each ``data.sources`` entry. Omitted entries use
+``actor.model.openpi_data.norm_stats_path``. Preserve the base model's image
+slot and state prompt format as well: ``openpi_data.image_slot: base_0_rgb``
+places the selected image in the base slot, and
+``openpi_data.flatten_state_before_tokenization: false`` tokenizes the two
+history rows before flattening the numerical state. Defaults retain the wrist
+slot and flatten the from-start history before tokenization. Choose these
+settings from the base model's saved pipeline, rather than its tensor shapes.
+
+Retain the checkpoint's prompt and normalization conventions when preparing
+these data. An episode held out only from Stage 1 may already have been used to
+train the base VLA. The 32-state action-probe input bundles and real-world
+observation adapters used by the original UMI recipe must be adapted separately
+before using them with this representation.
+
 Run the Provided Franka Example
 -------------------------------
 

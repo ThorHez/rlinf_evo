@@ -463,6 +463,41 @@ Runner 在第一次更新前评估初始模型，并选择 ``action_mse`` 最低
 
 如果保存 checkpoint 后又执行了未保存的更新，恢复时将 ``runner.logger.tensorboard_purge_step`` 设为第一个需要重新计算的步数。TensorBoard 会隐藏旧的后续事件并保留之前的历史；若有意回退 checkpoint 选择记录，应使用新的输出目录。
 
+训练使用起点相对状态的 UMI checkpoint
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+使用相对 episode 起点位置训练的 checkpoint 采用不同的状态编码。设置 ``actor.model.openpi.config_name: pi05_umi_v4_from_start``，并提供该 checkpoint 的归一化文件。每条观测包含两帧 10 维状态，依次为相对起点的 XYZ、相对起点的 6D 旋转和夹爪宽度；先归一化 XYZ，再按时间顺序展平为 20 个标量并 tokenize。动作仍为相对当前观测的 16 个目标，每个目标有 10 个有效维度，输入模型前补齐至 32 维。已有 ``pi05_umi_v4`` 配置保持原来的 32 维状态编码。
+
+多个数据源通过 ``data.sources`` 分别选择 episode 和图像布局。例如，在保留验证集的配置中添加：
+
+.. code:: yaml
+
+   actor:
+     model:
+       openpi:
+         config_name: pi05_umi_v4_from_start
+       openpi_data:
+         norm_stats_path: /path/to/from_start/assets/norm_stats.json
+   data:
+     sources:
+       - repo_id: /path/to/historical_dataset
+         image_horizon: 2
+         weight: 1.0
+         train_episode_ids: /path/to/historical_train.json
+         val_episode_ids: /path/to/historical_val.json
+       - repo_id: /path/to/recent_dataset
+         image_horizon: 1
+         weight: 20.0
+         train_episode_ids: /path/to/recent_train.json
+         val_episode_ids: /path/to/recent_val.json
+     val_frames_per_episode: 36
+
+设置 ``data.sources`` 后，以各数据源的 episode 列表为准，单数据集的 episode 列表不再参与选择。权重作用于每一帧：数据源的采样概率正比于已选训练帧数乘以权重。训练采用有放回采样，各 rank 分担同一个固定 seed 生成的序列；验证使用固定帧，在所有数据源间交错排列 episode，不使用训练采样权重。恢复训练时会核对数据源路径、episode 划分、权重、图像布局和归一化的签名。
+
+如果基础模型为各份采集数据分别使用归一化参数，在每个 ``data.sources`` 条目中设置 ``norm_stats_path``；未设置时使用 ``actor.model.openpi_data.norm_stats_path``。图像槽位和状态 prompt 格式也应沿用基础模型：``openpi_data.image_slot: base_0_rgb`` 将所选图像放入 base 槽位，``openpi_data.flatten_state_before_tokenization: false`` 则先对两行历史状态生成 token，再展平数值状态。默认仍使用 wrist 槽位，并在 tokenization 前展平 from-start 历史。应根据基础模型保存的 pipeline 选择这些设置，不能仅凭 tensor shape 判断。
+
+准备数据时保留 checkpoint 对应的 prompt 和归一化约定。仅从 Stage 1 留出的 episode，可能已经参与过基础 VLA 训练。旧 UMI 配置使用的 32 维状态 action-probe 输入文件和真机观测适配器，需要另外适配后才能用于这个状态编码。
+
 运行当前 Franka 示例
 --------------------
 

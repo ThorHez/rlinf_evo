@@ -511,7 +511,10 @@ class FSDPVlaSftWorker(FSDPSftWorker):
                 get_openpi_sft_data_order,
             )
 
-            if self.cfg.actor.model.openpi.config_name != "pi05_umi_v4":
+            if self.cfg.actor.model.openpi.config_name not in (
+                "pi05_umi_v4",
+                "pi05_umi_v4_from_start",
+            ):
                 raise ValueError(
                     "OpenPI cursor recovery requires deterministic UMI V4 transforms."
                 )
@@ -570,7 +573,10 @@ class FSDPVlaSftWorker(FSDPSftWorker):
                 restore_openpi_sft_iterator,
             )
 
-            if self.cfg.actor.model.openpi.config_name != "pi05_umi_v4":
+            if self.cfg.actor.model.openpi.config_name not in (
+                "pi05_umi_v4",
+                "pi05_umi_v4_from_start",
+            ):
                 raise ValueError(
                     "OpenPI cursor recovery requires deterministic UMI V4 transforms."
                 )

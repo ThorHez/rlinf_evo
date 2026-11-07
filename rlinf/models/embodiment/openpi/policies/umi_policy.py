@@ -22,7 +22,10 @@ from openpi import transforms
 
 @dataclasses.dataclass(frozen=True)
 class UmiV4Inputs(transforms.DataTransformFn):
-    """Pack two 16-dimensional states and the latest wrist image."""
+    """Pack two UMI states (16 or 10 features each) and the latest wrist image."""
+
+    from_start: bool = False
+    image_slot: str = "left_wrist_0_rgb"
 
     def __call__(self, data: dict) -> dict:
         fields = (
@@ -31,9 +34,19 @@ class UmiV4Inputs(transforms.DataTransformFn):
             ("robot0_eef_rot_axis_angle_wrt_start", (2, 6)),
             ("robot0_gripper_width", (2, 1)),
         )
+        if self.from_start:
+            fields = (
+                ("robot0_eef_pos_wrt_start", (2, 3)),
+                ("robot0_eef_rot_axis_angle_wrt_start", (2, 6)),
+                ("robot0_gripper_width", (2, 1)),
+            )
         states = []
         for key, shape in fields:
-            value = np.asarray(data[key])
+            value = (
+                np.asarray(data[key], dtype=np.float32)
+                if self.from_start
+                else np.asarray(data[key])
+            )
             if value.shape != shape:
                 raise ValueError(
                     f"UMI V4 {key} must have shape {shape}, got {value.shape}."
@@ -46,22 +59,24 @@ class UmiV4Inputs(transforms.DataTransformFn):
             image = image.transpose(1, 2, 0)
         if image.shape != (224, 224, 3) or image.dtype != np.uint8:
             raise ValueError("UMI V4 wrist images must be 224x224 RGB images.")
+        slots = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
+        if self.image_slot not in slots:
+            raise ValueError(f"Unsupported UMI image slot: {self.image_slot}")
         result = {
             "state": np.concatenate(states, axis=-1),
             "image": {
-                "base_0_rgb": np.zeros_like(image),
-                "left_wrist_0_rgb": image,
-                "right_wrist_0_rgb": np.zeros_like(image),
+                slot: image if slot == self.image_slot else np.zeros_like(image)
+                for slot in slots
             },
-            "image_mask": {
-                "base_0_rgb": np.False_,
-                "left_wrist_0_rgb": np.True_,
-                "right_wrist_0_rgb": np.False_,
-            },
+            "image_mask": {slot: np.bool_(slot == self.image_slot) for slot in slots},
             "prompt": data["prompt"],
         }
         if "actions" in data:
-            actions = np.asarray(data["actions"])
+            actions = (
+                np.asarray(data["actions"], dtype=np.float32)
+                if self.from_start
+                else np.asarray(data["actions"])
+            )
             if actions.shape != (16, 10):
                 raise ValueError(
                     "UMI V4 actions must already contain one (16, 10) action chunk; "
@@ -78,10 +93,12 @@ class UmiV4Normalize(transforms.DataTransformFn):
     affine: dict[str, tuple[np.ndarray, np.ndarray]]
 
     @classmethod
-    def from_stats(cls, stats: dict) -> "UmiV4Normalize":
+    def from_stats(cls, stats: dict, *, state_dim: int = 16) -> "UmiV4Normalize":
         """Build the original UMI affine transform, including constant ranges."""
         affine = {}
-        for key, dim in (("state", 16), ("actions", 10)):
+        if state_dim not in (10, 16):
+            raise ValueError("UMI state normalization requires 10 or 16 features.")
+        for key, dim in (("state", state_dim), ("actions", 10)):
             entry = stats[key]
             use_minmax = entry.get("min") is not None and entry.get("max") is not None
             lower = np.asarray(entry["min" if use_minmax else "q01"], dtype=np.float64)
@@ -111,14 +128,26 @@ class UmiV4Normalize(transforms.DataTransformFn):
 class UmiV4ModelInputs(transforms.DataTransformFn):
     """Flatten state after prompt tokenization and pad normalized actions."""
 
+    state_dim: int = 32
+
     def __call__(self, data: dict) -> dict:
         result = dict(data)
-        result["state"] = np.asarray(result["state"]).reshape(32).astype(np.float32)
+        result["state"] = (
+            np.asarray(result["state"]).reshape(self.state_dim).astype(np.float32)
+        )
         if "actions" in result:
             result["actions"] = transforms.pad_to_dim(
                 np.asarray(result["actions"], dtype=np.float32), 32
             )
         return result
+
+
+@dataclasses.dataclass(frozen=True)
+class UmiV4FlattenState(transforms.DataTransformFn):
+    """Flatten normalized history before tokenizing a from-start observation."""
+
+    def __call__(self, data: dict) -> dict:
+        return {**data, "state": np.asarray(data["state"]).reshape(20)}
 
 
 @dataclasses.dataclass(frozen=True)

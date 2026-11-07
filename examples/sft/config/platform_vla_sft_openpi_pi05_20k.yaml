@@ -1,0 +1,240 @@
+# Pure PyTorch Pi0.5 VLA SFT on server 78; no RL-token reconstruction loss.
+# Start from the converted platform/59999 base, not a Stage 1 checkpoint.
+# This file uses existing server-78 paths and the previous 12 LeRobot sources.
+# Newly collected demonstrations are NOT included until sources, normalization
+# and episode splits are updated. Keep whole episodes in only one split.
+# Existing split: 733 train / 81 validation episodes. The base VLA has already
+# seen these data; this is a fine-tuning holdout, not an unseen-pretraining test.
+# Validation samples 36 frames per episode (2,916 total), not every frame.
+# Source weights are per-frame sampling multipliers, not source probabilities.
+# Preserve per-source norm_stats, 20 Hz timing, 2x10 from-start state tokenization,
+# base_0_rgb image slot, task prompts from dataset, and 16x10 action chunks.
+# Full-model SFT: 4 GPUs (4-7) x microbatch 9 x accumulation 2 = global batch 72.
+# FP32 master weights/optimizer with BF16 model compute; no LoRA or frozen VLA.
+# Conservative continuation schedule: 20k steps, peak 1e-5, 1k warmup, cosine
+# decay to 2.5e-6. Both runner.max_steps and optim.total_training_steps are 20k.
+# Independent output directory; fresh optimizer (runner.resume_dir: null).
+# Save/evaluate every 1k steps; retain best action_mse and latest checkpoint.
+# Run from /data1/mason/RLinf after deploying this config and the UMI loader fix:
+# source logs/pi05_platform_stage1_20261105/environment.sh
+# unset CUDA_VISIBLE_DEVICES
+# .venv/bin/python -u examples/sft/train_vla_sft.py --config-name platform_vla_sft_openpi_pi05_20k
+# The environment above expects the existing dedicated Ray instance on :6385.
+# Generating this configuration does not start training.
+
+actor:
+  model:
+    model_type: openpi_rlinf
+    precision: fp32
+    is_lora: false
+    lora_rank: 32
+    num_action_chunks: 16
+    action_dim: 10
+    use_proprio: true
+    num_steps: 10
+    add_value_head: false
+    openpi:
+      task: sft
+      config_name: pi05_umi_v4_from_start
+      num_images_in_input: 1
+      action_chunk: 16
+      action_env_dim: 10
+      model_action_dim: 32
+      paligemma_variant: gemma_2b
+      action_expert_variant: gemma_300m
+      max_token_len: 200
+      compute_dtype: bf16
+      action_horizon: 16
+      num_steps: 10
+      action_loss_mask:
+      - 1
+      - 1
+      - 1
+      - 1
+      - 1
+      - 1
+      - 1
+      - 1
+      - 1
+      - 1
+      - 0
+      - 0
+      - 0
+      - 0
+      - 0
+      - 0
+      - 0
+      - 0
+      - 0
+      - 0
+      - 0
+      - 0
+      - 0
+      - 0
+      - 0
+      - 0
+      - 0
+      - 0
+      - 0
+      - 0
+      - 0
+      - 0
+      discrete_state_input: true
+      umi_v4_image_augmentation: false
+      use_rlt: false
+    pi05: true
+    model_path: /data1/mason/RLinf-runs/pi05_platform_stage1_20261105/base_model_fp32
+    openpi_data:
+      repo_id: umi_v4_from_start
+      norm_stats_path: /data1/mason/RLinf-runs/pi05_platform_stage1_20261105/base_model_fp32/assets/norm_stats.json
+      image_slot: base_0_rgb
+      flatten_state_before_tokenization: false
+  fsdp_config:
+    strategy: fsdp
+    sharding_strategy: full_shard
+    gradient_checkpointing: true
+    cpu_offload: false
+    offload_pin_memory: false
+    reshard_after_forward: true
+    enable_gradient_accumulation: true
+    forward_prefetch: false
+    limit_all_gathers: true
+    backward_prefetch: null
+    use_orig_params: false
+    use_liger_kernel: false
+    mixed_precision:
+      param_dtype: fp32
+      reduce_dtype: fp32
+      buffer_dtype: fp32
+    amp_autocast:
+      enabled: false
+      precision: bf16
+    grad_scaler:
+      enabled: false
+    gradient_checkpointing_use_reentrant: false
+    save_full_model_weights: true
+  group_name: ActorGroup
+  training_backend: fsdp
+  micro_batch_size: 9
+  global_batch_size: 72
+  seed: 42
+  optim:
+    lr: 1.0e-05
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    weight_decay: 1.0e-10
+    clip_grad: 1.0
+    total_training_steps: 20000
+    lr_warmup_steps: 1000
+    lr_scheduler: cosine
+    num_cycles: 0.5
+    min_lr_rate: 0.25
+  eval_batch_size: 9
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor: 4-7
+runner:
+  task_type: sft
+  logger:
+    log_path: /data1/mason/RLinf-runs/pi05_platform_vla_sft_20261107/run
+    project_name: rlinf-vla-sft
+    experiment_name: platform_vla_sft
+    logger_backends:
+    - tensorboard
+  max_epochs: -1
+  max_steps: 20000
+  val_check_interval: 1000
+  save_interval: 1000
+  resume_dir: null
+  eval_at_start: true
+  action_probe:
+    enabled: false
+  checkpoint_selection:
+    metric: action_mse
+    mode: min
+    keep_last: 1
+data:
+  train_data_paths: /data1/hzl_workspace_for_pi/data
+  num_workers: 1
+  save_openpi_resume_state: true
+  val_data_paths: /data1/hzl_workspace_for_pi/data
+  val_frames_per_episode: 36
+  val_num_batches: null
+  eval_seed: 20260924
+  eval_num_steps: 10
+  eval_token_shuffle: false
+  sources:
+  - repo_id: /data1/hzl_workspace_for_pi/data/20260427_pick_elec_meta_dataset
+    image_horizon: 1
+    weight: 1.0
+    norm_stats_path: /data1/mason/RLinf-runs/pi05_platform_stage1_20261105/base_model_fp32/assets/sources/00/norm_stats.json
+    train_episode_ids: /data1/mason/RLinf-runs/pi05_platform_stage1_20261105/data/00_train_episode_ids.json
+    val_episode_ids: /data1/mason/RLinf-runs/pi05_platform_stage1_20261105/data/00_val_episode_ids.json
+  - repo_id: /data1/hzl_workspace_for_pi/data/20260426_pick_elec_meta_dataset
+    image_horizon: 1
+    weight: 1.0
+    norm_stats_path: /data1/mason/RLinf-runs/pi05_platform_stage1_20261105/base_model_fp32/assets/sources/01/norm_stats.json
+    train_episode_ids: /data1/mason/RLinf-runs/pi05_platform_stage1_20261105/data/01_train_episode_ids.json
+    val_episode_ids: /data1/mason/RLinf-runs/pi05_platform_stage1_20261105/data/01_val_episode_ids.json
+  - repo_id: /data1/hzl_workspace_for_pi/data/260415_pick_elec_meta_dataset
+    image_horizon: 1
+    weight: 1.0
+    norm_stats_path: /data1/mason/RLinf-runs/pi05_platform_stage1_20261105/base_model_fp32/assets/sources/02/norm_stats.json
+    train_episode_ids: /data1/mason/RLinf-runs/pi05_platform_stage1_20261105/data/02_train_episode_ids.json
+    val_episode_ids: /data1/mason/RLinf-runs/pi05_platform_stage1_20261105/data/02_val_episode_ids.json
+  - repo_id: /data1/hzl_workspace_for_pi/data/20260428_pick_elec_meta_meeting_change_dataset
+    image_horizon: 1
+    weight: 1.0
+    norm_stats_path: /data1/mason/RLinf-runs/pi05_platform_stage1_20261105/base_model_fp32/assets/sources/03/norm_stats.json
+    train_episode_ids: /data1/mason/RLinf-runs/pi05_platform_stage1_20261105/data/03_train_episode_ids.json
+    val_episode_ids: /data1/mason/RLinf-runs/pi05_platform_stage1_20261105/data/03_val_episode_ids.json
+  - repo_id: /data1/hzl_workspace_for_pi/data/260414_pick_elec_meta_dataset
+    image_horizon: 1
+    weight: 1.0
+    norm_stats_path: /data1/mason/RLinf-runs/pi05_platform_stage1_20261105/base_model_fp32/assets/sources/04/norm_stats.json
+    train_episode_ids: /data1/mason/RLinf-runs/pi05_platform_stage1_20261105/data/04_train_episode_ids.json
+    val_episode_ids: /data1/mason/RLinf-runs/pi05_platform_stage1_20261105/data/04_val_episode_ids.json
+  - repo_id: /data1/hzl_workspace_for_pi/data/260416_pick_elec_meta_dataset
+    image_horizon: 1
+    weight: 1.0
+    norm_stats_path: /data1/mason/RLinf-runs/pi05_platform_stage1_20261105/base_model_fp32/assets/sources/05/norm_stats.json
+    train_episode_ids: /data1/mason/RLinf-runs/pi05_platform_stage1_20261105/data/05_train_episode_ids.json
+    val_episode_ids: /data1/mason/RLinf-runs/pi05_platform_stage1_20261105/data/05_val_episode_ids.json
+  - repo_id: /data1/hzl_workspace_for_pi/data/260417_pick_elec_meta_dataset
+    image_horizon: 1
+    weight: 1.0
+    norm_stats_path: /data1/mason/RLinf-runs/pi05_platform_stage1_20261105/base_model_fp32/assets/sources/06/norm_stats.json
+    train_episode_ids: /data1/mason/RLinf-runs/pi05_platform_stage1_20261105/data/06_train_episode_ids.json
+    val_episode_ids: /data1/mason/RLinf-runs/pi05_platform_stage1_20261105/data/06_val_episode_ids.json
+  - repo_id: /data1/hzl_workspace_for_pi/data/260423_pick_elec_meta_1811_dataset
+    image_horizon: 1
+    weight: 1.0
+    norm_stats_path: /data1/mason/RLinf-runs/pi05_platform_stage1_20261105/base_model_fp32/assets/sources/07/norm_stats.json
+    train_episode_ids: /data1/mason/RLinf-runs/pi05_platform_stage1_20261105/data/07_train_episode_ids.json
+    val_episode_ids: /data1/mason/RLinf-runs/pi05_platform_stage1_20261105/data/07_val_episode_ids.json
+  - repo_id: /data1/hzl_workspace_for_pi/data/260423_pick_elec_meta_1813_dataset
+    image_horizon: 1
+    weight: 1.0
+    norm_stats_path: /data1/mason/RLinf-runs/pi05_platform_stage1_20261105/base_model_fp32/assets/sources/08/norm_stats.json
+    train_episode_ids: /data1/mason/RLinf-runs/pi05_platform_stage1_20261105/data/08_train_episode_ids.json
+    val_episode_ids: /data1/mason/RLinf-runs/pi05_platform_stage1_20261105/data/08_val_episode_ids.json
+  - repo_id: /data1/hzl_workspace_for_pi/data/260504_pick_elec_meta_dataset
+    image_horizon: 1
+    weight: 1.0
+    norm_stats_path: /data1/mason/RLinf-runs/pi05_platform_stage1_20261105/base_model_fp32/assets/sources/09/norm_stats.json
+    train_episode_ids: /data1/mason/RLinf-runs/pi05_platform_stage1_20261105/data/09_train_episode_ids.json
+    val_episode_ids: /data1/mason/RLinf-runs/pi05_platform_stage1_20261105/data/09_val_episode_ids.json
+  - repo_id: /data1/hzl_workspace_for_pi/data/collect_demo_zmq_10_13_2
+    image_horizon: 1
+    weight: 50.0
+    norm_stats_path: /data1/mason/RLinf-runs/pi05_platform_stage1_20261105/base_model_fp32/assets/sources/10/norm_stats.json
+    train_episode_ids: /data1/mason/RLinf-runs/pi05_platform_stage1_20261105/data/10_train_episode_ids.json
+    val_episode_ids: /data1/mason/RLinf-runs/pi05_platform_stage1_20261105/data/10_val_episode_ids.json
+  - repo_id: /data1/hzl_workspace_for_pi/data/collect_demo_zmq_10_14
+    image_horizon: 1
+    weight: 80.0
+    norm_stats_path: /data1/mason/RLinf-runs/pi05_platform_stage1_20261105/base_model_fp32/assets/sources/11/norm_stats.json
+    train_episode_ids: /data1/mason/RLinf-runs/pi05_platform_stage1_20261105/data/11_train_episode_ids.json
+    val_episode_ids: /data1/mason/RLinf-runs/pi05_platform_stage1_20261105/data/11_val_episode_ids.json

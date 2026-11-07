@@ -2811,6 +2811,81 @@ def _umi_v4_sample():
     }
 
 
+@pytest.mark.parametrize("image_horizon", [1, 2])
+@pytest.mark.parametrize("flatten_before_tokenization", [True, False])
+@pytest.mark.parametrize("image_slot", ["left_wrist_0_rgb", "base_0_rgb"])
+def test_umi_from_start_preserves_twenty_scalar_history_tokens(
+    umi_v4_data_config, tmp_path, image_horizon, flatten_before_tokenization, image_slot
+):
+    from openpi.training.data_loader import transform_dataset
+
+    from rlinf.models.embodiment.openpi.dataconfig import get_openpi_config
+
+    _, processor = umi_v4_data_config
+    stats = {
+        key: {"min": [-2.0] * 10, "max": [2.0] * 10} for key in ("state", "actions")
+    }
+    stats_path = tmp_path / "from_start_stats.json"
+    stats_path.write_text(json.dumps({"norm_stats": stats}))
+    # The normalizer locates norm_stats.json in the selected asset directory.
+    (tmp_path / "norm_stats.json").write_text(stats_path.read_text())
+    config = get_openpi_config(
+        "pi05_umi_v4_from_start",
+        repo_id=str(tmp_path / "dataset"),
+        data_kwargs={
+            "norm_stats_path": str(tmp_path / "norm_stats.json"),
+            "image_horizon": image_horizon,
+            "image_slot": image_slot,
+            "flatten_state_before_tokenization": flatten_before_tokenization,
+        },
+    )
+    data_config = config.data.create(config.assets_dirs, config.model)
+    sample = _umi_v4_sample()
+    sample["observation.robot0_eef_pos_wrt_start"] = sample.pop(
+        "observation.robot0_eef_pos"
+    )
+    sample.pop("observation.robot0_eef_rot_axis_angle")
+    image = sample.pop("observation.left_wrist_0_rgb_1")
+    sample[f"observation.left_wrist_0_rgb_{image_horizon - 1}"] = image
+    result = transform_dataset([sample], data_config)[0]
+    expected = np.concatenate(
+        [
+            sample["observation.robot0_eef_pos_wrt_start"] / 2,
+            sample["observation.robot0_eef_rot_axis_angle_wrt_start"],
+            sample["observation.robot0_gripper_width"],
+        ],
+        axis=-1,
+    ).reshape(20)
+    np.testing.assert_array_equal(result["state"], expected)
+    normalized = np.concatenate(
+        [
+            sample["observation.robot0_eef_pos_wrt_start"].astype(np.float64) / 2,
+            sample["observation.robot0_eef_rot_axis_angle_wrt_start"],
+            sample["observation.robot0_gripper_width"],
+        ],
+        axis=-1,
+    ).reshape(20)
+    numbers = np.digitize(normalized, np.linspace(-1, 1, 257)[:-1]) - 1
+    if not flatten_before_tokenization:
+        numbers = numbers.reshape(2, 10)
+    text = "Task: pick cube, State: " + " ".join(map(str, numbers)) + ";\nAction: "
+    expected_tokens = processor.encode(text, add_bos=True)
+    np.testing.assert_array_equal(
+        result["tokenized_prompt"][result["tokenized_prompt_mask"]], expected_tokens
+    )
+    np.testing.assert_array_equal(
+        result["actions"][:, :3], sample["actions"][:, :3] / 2
+    )
+    np.testing.assert_array_equal(result["actions"][:, 3:10], sample["actions"][:, 3:])
+    np.testing.assert_array_equal(result["actions"][:, 10:], 0)
+    assert result["state"].shape == (20,)
+    assert result["actions"].shape == (16, 32)
+    np.testing.assert_array_equal(result["image"][image_slot], 127)
+    assert bool(result["image_mask"][image_slot])
+    for slot, value in result["image_mask"].items():
+        assert bool(value) == (slot == image_slot)
+
+
 def test_umi_v4_official_loader_preserves_history_and_action_contract(
     umi_v4_data_config,
 ):
@@ -3053,6 +3128,104 @@ def openpi_episode_loader(monkeypatch, tmp_path):
         )[0]
 
     return cfg, dataset, build
+
+
+@pytest.mark.parametrize("config_name", ["pi05_umi_v4", "pi05_umi_v4_from_start"])
+@pytest.mark.parametrize("evaluate", [False, True])
+def test_umi_sft_without_rlt_loads_episode_split(
+    openpi_episode_loader, config_name, evaluate
+):
+    from rlinf.data.datasets.openpi_rlinf import build_openpi_rlinf_sft_dataloader
+
+    cfg, _, _ = openpi_episode_loader
+    cfg.actor.model.openpi.config_name = config_name
+    cfg.actor.model.openpi.use_rlt = False
+    loader, _ = build_openpi_rlinf_sft_dataloader(
+        cfg, 2, 0, cfg.data.train_data_paths, eval_dataset=evaluate
+    )
+    _, actions = next(iter(loader))
+    expected_episodes = {1, 3, 5} if evaluate else {0, 2, 4}
+    assert set(actions[:, 0, 0].tolist()) <= expected_episodes
+    assert actions.shape == (3, 1, 2)
+
+
+def test_openpi_multisource_split_weights_and_resume_identity(
+    openpi_episode_loader, tmp_path
+):
+    from rlinf.data.datasets.openpi_rlinf.official_sft_data_loader import (
+        get_openpi_sft_data_order,
+        restore_openpi_sft_iterator,
+    )
+
+    cfg, _, build = openpi_episode_loader
+    norm = tmp_path / "norm_stats.json"
+    norm.write_text("{}")
+    cfg.actor.model.openpi_data = {"norm_stats_path": str(norm)}
+    cfg.data.sources = [
+        {
+            "repo_id": str(tmp_path / name),
+            "weight": weight,
+            "image_horizon": 2,
+            "train_episode_ids": [0, 2, 4],
+            "val_episode_ids": [1, 3, 5],
+        }
+        for name, weight in (("first", 1), ("second", 20))
+    ]
+    loader = build()
+    assert loader.episode_selection["selected_frame_count"] == 54
+    iterator = iter(loader)
+    for _ in range(3):
+        _, action = next(iterator)
+        assert set(action[:, 0, 0].tolist()) <= {0, 2, 4}
+    state = get_openpi_sft_data_order(loader)
+    state.update(consumed_samples=9, data_epoch=0)
+    expected = next(iterator)[1]
+    resumed, skipped = restore_openpi_sft_iterator(build(), state)
+    assert skipped == 3
+    torch.testing.assert_close(next(resumed)[1], expected)
+    # Altering weights must invalidate cursor recovery even for the same frames.
+    cfg.data.sources[1].weight = 10
+    with pytest.raises(ValueError, match="selection"):
+        restore_openpi_sft_iterator(build(), state)
+    cfg.data.sources[1].weight = 20
+    source_norm = tmp_path / "source_norm.json"
+    source_norm.write_text('{"different": true}')
+    cfg.data.sources[1].norm_stats_path = str(source_norm)
+    with pytest.raises(ValueError, match="selection"):
+        restore_openpi_sft_iterator(build(), state)
+    del cfg.data.sources[1].norm_stats_path
+    # Three local validation episodes per source are globally interleaved.
+    validation = build(world_size=1, evaluate=True)
+    assert validation.episode_selection["cross_episode_shuffle_verified"]
+    for _, actions in validation:
+        assert set(actions[:, 0, 0].tolist()) <= {1, 3, 5}
+    cfg.data.sources[1].val_episode_ids = [0, 3, 5]
+    with pytest.raises(ValueError, match="disjoint"):
+        build()
+
+
+def test_openpi_weighted_sampling_preserves_distribution_and_replica_positions():
+    from rlinf.data.datasets.openpi_rlinf.multisource import DistributedWeightedSampler
+
+    size = 30000
+    dataset = range(size)
+    weights = np.r_[np.ones(size // 2), np.full(size // 2, 20.0)]
+    ranks = [
+        DistributedWeightedSampler(
+            dataset, weights, num_replicas=3, rank=rank, seed=43, drop_last=True
+        )
+        for rank in range(3)
+    ]
+    first = [list(sampler) for sampler in ranks]
+    combined = np.stack(first, axis=1).reshape(-1)
+    single = DistributedWeightedSampler(
+        dataset, weights, num_replicas=1, rank=0, seed=43, drop_last=True
+    )
+    np.testing.assert_array_equal(combined, list(single))
+    assert abs(np.mean(combined >= size // 2) - 20 / 21) < 0.01
+    assert list(ranks[0]) == first[0]
+    ranks[0].set_epoch(1)
+    assert list(ranks[0]) != first[0]
 
 
 def test_openpi_episode_split_preserves_original_frames_and_rank_disjointness(

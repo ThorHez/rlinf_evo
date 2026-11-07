@@ -79,6 +79,17 @@ from rlinf.models.embodiment.openpi.dataconfig.umi_dataconfig import (
 
 _CONFIGS = [
     TrainConfig(
+        name="pi05_umi_v4_from_start",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_dim=32, action_horizon=16, max_token_len=200
+        ),
+        data=LeRobotUmiV4DataConfig(
+            repo_id="umi_v4_from_start",
+            assets=AssetsConfig(asset_id="assets"),
+            from_start=True,
+        ),
+    ),
+    TrainConfig(
         name="pi05_umi_v4",
         model=pi0_config.Pi0Config(
             pi05=True, action_dim=32, action_horizon=16, max_token_len=200

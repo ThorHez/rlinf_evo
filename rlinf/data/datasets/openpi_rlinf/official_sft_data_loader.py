@@ -70,6 +70,12 @@ def build_official_openpi_sft_dataloader(
     """
     if world_size < 1 or not 0 <= rank < world_size:
         raise ValueError("OpenPI rank must be within a positive world size.")
+    if OmegaConf.select(cfg, "data.sources") is not None:
+        from rlinf.data.datasets.openpi_rlinf.multisource import (
+            build_multisource_openpi_loader,
+        )
+
+        return build_multisource_openpi_loader(cfg, world_size, rank, eval_dataset)
     repo_id = resolve_lerobot_repo_id(data_paths)
     if repo_id is None:
         raise ValueError(
